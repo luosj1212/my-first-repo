@@ -2,11 +2,22 @@
 # compare_forces.py
 # (see chat for detailed description)
 from __future__ import annotations
-import os, math, shutil, subprocess, re
+
+import json
+from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional, Set
-import numpy as np
-import pandas as pd
+from dataclasses import asdict
+from typing import Any, Dict, Iterable, List, MutableMapping, Set, Tuple
+
+try:  # pragma: no cover - 环境可能缺失 numpy
+    import numpy as np  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - 仅在缺失时触发
+    np = None  # type: ignore
+
+try:  # pragma: no cover - 环境可能缺失 pandas
+    import pandas as pd  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    pd = None  # type: ignore
 
 KELEC = 138.935456  # kJ mol^-1 nm e^-2
 # >>> ADDED FOR LJ-v DUMP
@@ -18,6 +29,16 @@ def enable_invr_dump(flag: bool):
     global DUMP_INVR, _invr_records
     DUMP_INVR = bool(flag)
     _invr_records = []
+
+
+def _require_numpy() -> None:
+    if np is None:
+        raise RuntimeError('该功能需要 numpy，请先安装 numpy')
+
+
+def _require_pandas() -> None:
+    if pd is None:
+        raise RuntimeError('该功能需要 pandas，请先安装 pandas')
  
 @dataclass
 class AtomType:
@@ -31,6 +52,7 @@ class AtomType:
 class Atom:
     idx: int
     type_name: str
+    name: str
     charge: float
 
 @dataclass
@@ -59,7 +81,8 @@ class Topology:
     comb_rule: int
 
 def parse_itp(itp_path: str) -> Topology:
-    lines = open(itp_path, 'r', errors='ignore').read().splitlines()
+    with open(itp_path, 'r', errors='ignore') as fh:
+        lines = fh.read().splitlines()
     fudgeLJ=fudgeQQ=0.5; comb_rule=3; nrexcl=3
     atomtypes: Dict[str, AtomType] = {}
     atoms: List[Atom] = []
@@ -108,8 +131,8 @@ def parse_itp(itp_path: str) -> Topology:
         if sec=='atoms':
             toks=s.split()
             if len(toks)>=8:
-                idx=int(toks[0]); tname=toks[1]; charge=float(toks[6])
-                atoms.append(Atom(idx,tname,charge))
+                idx=int(toks[0]); tname=toks[1]; aname=toks[4]; charge=float(toks[6])
+                atoms.append(Atom(idx=idx, type_name=tname, name=aname, charge=charge))
             continue
 
         if sec=='bonds':
@@ -151,16 +174,253 @@ def parse_itp(itp_path: str) -> Topology:
 
     return Topology(atomtypes, atoms, bonds, angles, rb_dihedrals, pairs14, nrexcl, fudgeLJ, fudgeQQ, comb_rule)
 
-def read_gro(gro_path: str):
-    lines = open(gro_path,'r',errors='ignore').read().splitlines()
+
+def topology_to_dict(top: Topology) -> Dict[str, object]:
+    """序列化拓扑和参数，便于保存到 JSON。"""
+    atomtypes = {
+        name: {
+            "sigma": at.sigma,
+            "epsilon": at.epsilon,
+            "C6": at.C6,
+            "C12": at.C12,
+        }
+        for name, at in top.atomtypes.items()
+    }
+    atoms = [
+        {
+            "idx": atom.idx,
+            "type_name": atom.type_name,
+            "name": atom.name,
+            "charge": atom.charge,
+        }
+        for atom in top.atoms
+    ]
+    bonds = [asdict(b) for b in top.bonds]
+    angles = [asdict(a) for a in top.angles]
+    dihedrals = [
+        {
+            "i": d.i,
+            "j": d.j,
+            "k": d.k,
+            "l": d.l,
+            "funct": d.funct,
+            "c": list(d.c),
+        }
+        for d in top.rb_dihedrals
+    ]
+    data = {
+        "atomtypes": atomtypes,
+        "atoms": atoms,
+        "bonds": bonds,
+        "angles": angles,
+        "rb_dihedrals": dihedrals,
+        "pairs14": [list(pair) for pair in sorted(top.pairs14)],
+        "nrexcl": top.nrexcl,
+        "fudgeLJ": top.fudgeLJ,
+        "fudgeQQ": top.fudgeQQ,
+        "comb_rule": top.comb_rule,
+    }
+    return data
+
+
+def topology_from_dict(data: MutableMapping[str, object]) -> Topology:
+    """从 JSON 数据反序列化拓扑。"""
+    atomtypes = {
+        name: AtomType(
+            name=name,
+            sigma=values["sigma"],
+            epsilon=values["epsilon"],
+            C6=values["C6"],
+            C12=values["C12"],
+        )
+        for name, values in data["atomtypes"].items()
+    }
+
+    atoms = [
+        Atom(
+            idx=item["idx"],
+            type_name=item["type_name"],
+            name=item["name"],
+            charge=item["charge"],
+        )
+        for item in data["atoms"]
+    ]
+
+    bonds = [Bond(**item) for item in data.get("bonds", [])]
+    angles = [Angle(**item) for item in data.get("angles", [])]
+    dihedrals = [
+        RB_Dihedral(
+            i=item["i"],
+            j=item["j"],
+            k=item["k"],
+            l=item["l"],
+            funct=item["funct"],
+            c=tuple(item["c"]),
+        )
+        for item in data.get("rb_dihedrals", [])
+    ]
+    pairs14 = {tuple(pair) for pair in data.get("pairs14", [])}
+
+    return Topology(
+        atomtypes=atomtypes,
+        atoms=atoms,
+        bonds=bonds,
+        angles=angles,
+        rb_dihedrals=dihedrals,
+        pairs14=pairs14,
+        nrexcl=int(data.get("nrexcl", 3)),
+        fudgeLJ=float(data.get("fudgeLJ", 1.0)),
+        fudgeQQ=float(data.get("fudgeQQ", 1.0)),
+        comb_rule=int(data.get("comb_rule", 3)),
+    )
+
+
+def save_topology_json(top: Topology, path: str, indent: int = 2) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(topology_to_dict(top), f, indent=indent, ensure_ascii=False)
+
+
+def load_topology_json(path: str) -> Topology:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return topology_from_dict(data)
+
+
+def _increment_group(groups: MutableMapping[Tuple, dict], key: Tuple, payload: dict) -> None:
+    if key in groups:
+        groups[key]["count"] += 1
+    else:
+        data = dict(payload)
+        data["count"] = 1
+        groups[key] = data
+
+
+def build_parameter_summary(top: Topology) -> Dict[str, object]:
+    """聚合 LJ、键、角、二面角参数，方便检查与持久化。"""
+
+    lj = {
+        name: {
+            "sigma": at.sigma,
+            "epsilon": at.epsilon,
+            "C6": at.C6,
+            "C12": at.C12,
+        }
+        for name, at in top.atomtypes.items()
+    }
+
+    bond_groups: Dict[Tuple, dict] = {}
+    for b in top.bonds:
+        t1 = top.atoms[b.i - 1].type_name
+        t2 = top.atoms[b.j - 1].type_name
+        types = tuple(sorted((t1, t2)))
+        key = (types, b.funct, round(b.r0, 6), round(b.k, 6))
+        payload = {"types": list(types), "funct": b.funct, "r0": b.r0, "k": b.k}
+        _increment_group(bond_groups, key, payload)
+
+    angle_groups: Dict[Tuple, dict] = {}
+    for ang in top.angles:
+        types = (
+            top.atoms[ang.i - 1].type_name,
+            top.atoms[ang.j - 1].type_name,
+            top.atoms[ang.k - 1].type_name,
+        )
+        key = (types, ang.funct, round(ang.theta0_deg, 6), round(ang.k_theta, 6))
+        payload = {
+            "types": list(types),
+            "funct": ang.funct,
+            "theta0_deg": ang.theta0_deg,
+            "k_theta": ang.k_theta,
+        }
+        _increment_group(angle_groups, key, payload)
+
+    dihedral_groups: Dict[Tuple, dict] = {}
+    for dih in top.rb_dihedrals:
+        types = (
+            top.atoms[dih.i - 1].type_name,
+            top.atoms[dih.j - 1].type_name,
+            top.atoms[dih.k - 1].type_name,
+            top.atoms[dih.l - 1].type_name,
+        )
+        key = (types, dih.funct, tuple(round(v, 6) for v in dih.c))
+        payload = {
+            "types": list(types),
+            "funct": dih.funct,
+            "c": list(dih.c),
+        }
+        _increment_group(dihedral_groups, key, payload)
+
+    return {
+        "lj": lj,
+        "bonds": list(bond_groups.values()),
+        "angles": list(angle_groups.values()),
+        "dihedrals": list(dihedral_groups.values()),
+    }
+
+
+def save_parameter_summary(summary: Dict[str, object], path: str, indent: int = 2) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=indent, ensure_ascii=False)
+
+def read_gro(gro_path: str) -> Tuple[Any, Any, List[str]]:
+    with open(gro_path, 'r', errors='ignore') as fh:
+        lines = fh.read().splitlines()
     n = int(lines[1].strip())
-    coords = []
-    for i in range(2,2+n):
-        line=lines[i]
-        x=float(line[20:28]); y=float(line[28:36]); z=float(line[36:44])
-        coords.append([x,y,z])
-    box = list(map(float, lines[2+n].split()[:3]))
-    return np.array(coords, dtype=float), np.array(box, dtype=float)
+    coords: List[List[float]] = []
+    names: List[str] = []
+    for i in range(2, 2 + n):
+        line = lines[i]
+        atom_name = line[10:15].strip()
+        x = float(line[20:28])
+        y = float(line[28:36])
+        z = float(line[36:44])
+        coords.append([x, y, z])
+        names.append(atom_name)
+    box = list(map(float, lines[2 + n].split()[:3]))
+    if np is not None:
+        return np.array(coords, dtype=float), np.array(box, dtype=float), names
+    return coords, box, names
+
+
+def align_coords_to_topology(
+    coords: Any,
+    atom_names: Iterable[str],
+    top: Topology,
+) -> Tuple[Any, List[str]]:
+    """根据原子名称调整坐标顺序，使其与拓扑一致。"""
+
+    atom_names = list(atom_names)
+    target_names = [atom.name for atom in top.atoms]
+    if len(atom_names) != len(target_names):
+        raise ValueError(
+            f"原子数量不一致：GRO 文件含 {len(atom_names)} 个，拓扑含 {len(target_names)} 个"
+        )
+
+    if atom_names == target_names:
+        return coords, list(atom_names)
+
+    mapping: Dict[str, List[int]] = {}
+    for idx, name in enumerate(atom_names):
+        mapping.setdefault(name, []).append(idx)
+
+    used_index: Dict[str, int] = {}
+    if np is not None:
+        reordered = np.zeros_like(coords)
+    else:
+        reordered = [[0.0, 0.0, 0.0] for _ in range(len(coords))]
+    reordered_names: List[str] = []
+    for pos, name in enumerate(target_names):
+        candidates = mapping.get(name)
+        if not candidates:
+            raise KeyError(f"无法在 GRO 中找到与拓扑原子 {name!r} 对应的坐标")
+        offset = used_index.get(name, 0)
+        if offset >= len(candidates):
+            raise ValueError(f"拓扑原子 {name!r} 出现次数多于 GRO 文件")
+        gro_idx = candidates[offset]
+        used_index[name] = offset + 1
+        reordered[pos] = coords[gro_idx]
+        reordered_names.append(atom_names[gro_idx])
+
+    return reordered, reordered_names
 
 def build_exclusions(top: Topology) -> Set[Tuple[int,int]]:
     n = len(top.atoms)
@@ -180,7 +440,8 @@ def build_exclusions(top: Topology) -> Set[Tuple[int,int]]:
                     excl.add((a,b))
     return excl
 
-def minimum_image_vec(rij: np.ndarray, box: np.ndarray) -> np.ndarray:
+def minimum_image_vec(rij: Any, box: Any) -> Any:
+    _require_numpy()
     # rij shape (...,3); box shape (3,)
     out = rij.copy()
     for d in range(3):
@@ -189,6 +450,7 @@ def minimum_image_vec(rij: np.ndarray, box: np.ndarray) -> np.ndarray:
     return out
 
 def pair_lj_force(rvec, C6, C12):
+    _require_numpy()
     r2 = np.sum(rvec*rvec, axis=1)
     invr2 = 1.0/np.clip(r2, 1e-24, None)
     invr6 = invr2**3
@@ -208,7 +470,8 @@ def write_invr_distribution(path_csv: str = "invr_values.csv", path_summary: str
     if not _invr_records:
         print("[invr] no records to dump.")
         return
-    import numpy as np, pandas as pd
+    _require_numpy()
+    _require_pandas()
     invr = np.concatenate(_invr_records, axis=0)  # (M,)
     pd.DataFrame({"invr": invr}).to_csv(path_csv, index=False)
     qs = [0, 1, 5, 25, 50, 75, 95, 99, 100]
@@ -218,15 +481,17 @@ def write_invr_distribution(path_csv: str = "invr_values.csv", path_summary: str
     print(f"[invr] wrote {path_csv} and {path_summary}")
  
 def pair_coul_force(rvec, qq):
+    _require_numpy()
     r2 = np.sum(rvec*rvec, axis=1)
     invr = 1.0/np.sqrt(np.clip(r2,1e-24,None))
     coef = KELEC * qq * (invr**2)
     return - (coef[:,None] * rvec * invr[:,None])
 
-def compute_forces(top:Topology, coords:np.ndarray, box:np.ndarray,
+def compute_forces(top:Topology, coords:Any, box:Any,
                    rcoul=1.2, rvdw=1.2,
                    enable_nb=True, enable_bond=True, enable_angle=True, enable_dih=True,
                    split_nb=False):
+    _require_numpy()
     """
     返回：
       - 若 split_nb=False：返回 total_forces (N,3)
@@ -399,48 +664,83 @@ def compute_forces(top:Topology, coords:np.ndarray, box:np.ndarray,
 
 
 
-def save_df(arr: np.ndarray, path: str):
+def save_df(arr: Any, path: str):
+    _require_numpy()
+    _require_pandas()
     df = pd.DataFrame(arr, columns=['Fx','Fy','Fz'])
     df.index = np.arange(1, len(df)+1)
     df.to_csv(path, index_label='atom')
 
+
 def main():
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--gro', default='peg9.gro')
-    ap.add_argument('--itp', default='peg9.itp')
-    ap.add_argument('--rcoul', type=float, default=1.2)
-    ap.add_argument('--rvdw', type=float, default=1.2)
-    ap.add_argument('--per_term', action='store_true', help='导出逐项CSV（LJ/COUL/BOND/ANGLE/DIH/总和）')
-    ap.add_argument('--no_nb_split', action='store_true', help='与per_term合用时：不拆分LJ/COUL，只导出NB一项')
-    ap.add_argument('--dump_invr', action='store_true', help='导出 1/r 的明细与分布 (invr_values.csv, invr_summary.csv)')
+
+    ap = argparse.ArgumentParser(description='比较/计算分子力场作用力的辅助工具')
+    sub = ap.add_subparsers(dest='command', required=True)
+
+    ap_extract = sub.add_parser('extract', help='从 ITP 文件提取并保存参数')
+    ap_extract.add_argument('--itp', default='peg9.itp', help='输入 ITP 文件路径')
+    ap_extract.add_argument('--out', default='topology.json', help='保存拓扑及参数的 JSON 文件路径')
+    ap_extract.add_argument('--summary', help='参数汇总 JSON 输出路径（默认为 <out> 同目录下 *_summary.json）')
+
+    ap_compute = sub.add_parser('compute', help='根据保存的参数与 GRO 坐标计算受力')
+    ap_compute.add_argument('--gro', default='peg9.gro', help='输入 GRO 文件路径')
+    ap_compute.add_argument('--params', default='topology.json', help='extract 阶段生成的 JSON 参数文件')
+    ap_compute.add_argument('--rcoul', type=float, default=1.2)
+    ap_compute.add_argument('--rvdw', type=float, default=1.2)
+    ap_compute.add_argument('--per_term', action='store_true', help='导出逐项CSV（LJ/COUL/BOND/ANGLE/DIH/总和）')
+    ap_compute.add_argument('--no_nb_split', action='store_true', help='与per_term合用时：不拆分LJ/COUL，只导出NB一项')
+    ap_compute.add_argument('--dump_invr', action='store_true', help='导出 1/r 的明细与分布 (invr_values.csv, invr_summary.csv)')
 
     args = ap.parse_args()
-    top = parse_itp(args.itp)
-    enable_invr_dump(args.dump_invr)
 
-    coords, box = read_gro(args.gro)
+    if args.command == 'extract':
+        top = parse_itp(args.itp)
+        out_path = Path(args.out)
+        save_topology_json(top, str(out_path))
 
-    if args.per_term:
-        parts = compute_forces(top, coords, box, args.rcoul, args.rvdw, split_nb=not args.no_nb_split)
-        import pandas as pd, numpy as np
-        def dump(name, arr):
-            df = pd.DataFrame(arr, columns=['Fx','Fy','Fz'])
-            df.index = np.arange(1, len(df)+1)
-            df.to_csv(f'my_{name}.csv', index_label='atom')
-        if isinstance(parts, dict):
-            for k,v in parts.items():
-                dump(k, v)
+        if args.summary is None:
+            summary_path = out_path.with_name(out_path.stem + '_summary.json')
         else:
-            dump('TOTAL', parts)
-        print('[OK] wrote per-term CSVs (my_*.csv)')
-    else:
-        myF = compute_forces(top, coords, box, args.rcoul, args.rvdw)
-        save_df(myF, 'my_forces.csv')
-        print('[OK] my_forces.csv')
-    if args.dump_invr:
-        # 计算结束后统一写出
-        write_invr_distribution()
- 
+            summary_path = Path(args.summary)
+
+        summary = build_parameter_summary(top)
+        save_parameter_summary(summary, str(summary_path))
+        print(f"[OK] topology saved to {out_path} and summary saved to {summary_path}")
+        return
+
+    if args.command == 'compute':
+        top = load_topology_json(args.params)
+        enable_invr_dump(args.dump_invr)
+
+        coords_raw, box, atom_names = read_gro(args.gro)
+        coords, _ = align_coords_to_topology(coords_raw, atom_names, top)
+
+        if args.per_term:
+            parts = compute_forces(top, coords, box, args.rcoul, args.rvdw, split_nb=not args.no_nb_split)
+
+            def dump(name: str, arr: Any) -> None:
+                _require_numpy()
+                _require_pandas()
+                df = pd.DataFrame(arr, columns=['Fx','Fy','Fz'])
+                df.index = np.arange(1, len(df)+1)
+                df.to_csv(f'my_{name}.csv', index_label='atom')
+
+            if isinstance(parts, dict):
+                for k, v in parts.items():
+                    dump(k, v)
+            else:
+                dump('TOTAL', parts)
+            print('[OK] wrote per-term CSVs (my_*.csv)')
+        else:
+            myF = compute_forces(top, coords, box, args.rcoul, args.rvdw)
+            save_df(myF, 'my_forces.csv')
+            print('[OK] my_forces.csv')
+
+        if args.dump_invr:
+            # 计算结束后统一写出
+            write_invr_distribution()
+        return
+
 if __name__=='__main__':
     main()
