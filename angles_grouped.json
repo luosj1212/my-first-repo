@@ -1,0 +1,50 @@
+[
+  {
+    "pattern": "cch",
+    "funct": "1",
+    "param1": "110.700",
+    "param2": "313.800",
+    "count": 36,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "cco",
+    "funct": "1",
+    "param1": "109.500",
+    "param2": "418.400",
+    "count": 18,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "coc",
+    "funct": "1",
+    "param1": "109.500",
+    "param2": "502.080",
+    "count": 8,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "coh",
+    "funct": "1",
+    "param1": "108.500",
+    "param2": "460.240",
+    "count": 2,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "hch",
+    "funct": "1",
+    "param1": "107.800",
+    "param2": "276.144",
+    "count": 18,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "hco",
+    "funct": "1",
+    "param1": "109.500",
+    "param2": "292.880",
+    "count": 36,
+    "param_conflict": "no"
+  }
+]

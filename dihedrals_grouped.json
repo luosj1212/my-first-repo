@@ -1,0 +1,98 @@
+[
+  {
+    "pattern": "ccoc",
+    "funct": "3",
+    "param1": "1.715",
+    "param2": "2.845",
+    "param3": "1.046",
+    "param4": "-5.607",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 16,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "ccoh",
+    "funct": "3",
+    "param1": "-0.444",
+    "param2": "3.833",
+    "param3": "0.728",
+    "param4": "-4.117",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 2,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "coch",
+    "funct": "3",
+    "param1": "1.590",
+    "param2": "4.770",
+    "param3": "0.000",
+    "param4": "-6.360",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 32,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "hcch",
+    "funct": "3",
+    "param1": "0.628",
+    "param2": "1.883",
+    "param3": "0.000",
+    "param4": "-2.510",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 36,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "hcco",
+    "funct": "3",
+    "param1": "0.979",
+    "param2": "2.937",
+    "param3": "0.000",
+    "param4": "-3.916",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 36,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "hcoh",
+    "funct": "3",
+    "param1": "0.736",
+    "param2": "2.209",
+    "param3": "0.000",
+    "param4": "-2.946",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 4,
+    "param_conflict": "no"
+  },
+  {
+    "pattern": "occo",(一端是羟基氧)
+    "funct": "3",
+    "param1": "9.035",
+    "param2": "-9.035",
+    "param3": "0.000",
+    "param4": "-0.000",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 9,
+    "param_conflict": "yes"
+  },
+  {
+    "pattern": "occo",(无羟基氧)
+    "funct": "3",
+    "param1": "-1.151",
+    "param2": "1.151",
+    "param3": "0.000",
+    "param4": "-0.000",
+    "param5": "-0.000",
+    "param6": "0.000",
+    "count": 9,
+    "param_conflict": "yes"
+  }
+]
