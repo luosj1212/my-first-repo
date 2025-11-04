@@ -1,0 +1,383 @@
+{
+  "defaults": {
+    "nrexcl": 3,
+    "fudgeLJ": 0.5,
+    "fudgeQQ": 0.5,
+    "comb_rule": 3
+  },
+  "lj": [
+    {
+      "element": "c",
+      "sigma": 0.35,
+      "epsilon": 0.276144,
+      "C6": 0.0020305040909999995,
+      "C12": 3.732605871907169e-06,
+      "count": 6,
+      "neighbor_patterns": [
+        "chho"
+      ],
+      "type_names": [
+        "opls_801",
+        "opls_802",
+        "opls_804",
+        "opls_805",
+        "opls_807",
+        "opls_808"
+      ],
+      "charge": 0,
+      "variant": "default"
+    },
+    {
+      "element": "h",
+      "sigma": 0.0,
+      "epsilon": 0.0,
+      "C6": 0.0,
+      "C12": 0.0,
+      "count": 2,
+      "neighbor_patterns": [
+        "o"
+      ],
+      "type_names": [
+        "opls_810",
+        "opls_823"
+      ],
+      "charge": 0,
+      "variant": "hydroxyl"
+    },
+    {
+      "element": "h",
+      "sigma": 0.25,
+      "epsilon": 0.12552,
+      "C6": 0.000122578125,
+      "C12": 2.992630004882812e-08,
+      "count": 12,
+      "neighbor_patterns": [
+        "c"
+      ],
+      "type_names": [
+        "opls_811",
+        "opls_812",
+        "opls_813",
+        "opls_814",
+        "opls_815",
+        "opls_816",
+        "opls_817",
+        "opls_818",
+        "opls_819",
+        "opls_820",
+        "opls_821",
+        "opls_822"
+      ],
+      "charge": 0,
+      "variant": "default"
+    },
+    {
+      "element": "o",
+      "sigma": 0.29,
+      "epsilon": 0.58576,
+      "C6": 0.0013936948340358393,
+      "C12": 8.290021896417414e-07,
+      "count": 2,
+      "neighbor_patterns": [
+        "cc"
+      ],
+      "type_names": [
+        "opls_803",
+        "opls_806"
+      ],
+      "charge": 0,
+      "variant": "default"
+    },
+    {
+      "element": "o",
+      "sigma": 0.312,
+      "epsilon": 0.71128,
+      "C6": 0.0026243886610635347,
+      "C12": 2.4207821969965596e-06,
+      "count": 2,
+      "neighbor_patterns": [
+        "ch"
+      ],
+      "type_names": [
+        "opls_800",
+        "opls_809"
+      ],
+      "charge": 0,
+      "variant": "hydroxyl"
+    }
+  ],
+  "bonds": [
+    {
+      "pattern": "cc",
+      "funct": 1,
+      "r0": 0.1529,
+      "k": 224262.4,
+      "count": 3
+    },
+    {
+      "pattern": "ch",
+      "funct": 1,
+      "r0": 0.109,
+      "k": 284512.0,
+      "count": 12
+    },
+    {
+      "pattern": "co",
+      "funct": 1,
+      "r0": 0.141,
+      "k": 267776.0,
+      "count": 6
+    },
+    {
+      "pattern": "ho",
+      "funct": 1,
+      "r0": 0.0945,
+      "k": 462750.4,
+      "count": 2
+    }
+  ],
+  "angles": [
+    {
+      "pattern": "cch",
+      "funct": 1,
+      "theta0_deg": 110.7,
+      "k_theta": 313.8,
+      "symmetry_key": "c|ch",
+      "equivalent_patterns": [
+        "cch"
+      ],
+      "count": 12
+    },
+    {
+      "pattern": "occ",
+      "funct": 1,
+      "theta0_deg": 109.5,
+      "k_theta": 418.4,
+      "symmetry_key": "c|co",
+      "equivalent_patterns": [
+        "cco",
+        "occ"
+      ],
+      "count": 6
+    },
+    {
+      "pattern": "hch",
+      "funct": 1,
+      "theta0_deg": 107.8,
+      "k_theta": 276.144,
+      "symmetry_key": "c|hh",
+      "equivalent_patterns": [
+        "hch"
+      ],
+      "count": 6
+    },
+    {
+      "pattern": "och",
+      "funct": 1,
+      "theta0_deg": 109.5,
+      "k_theta": 292.88,
+      "symmetry_key": "c|ho",
+      "equivalent_patterns": [
+        "och"
+      ],
+      "count": 12
+    },
+    {
+      "pattern": "coc",
+      "funct": 1,
+      "theta0_deg": 109.5,
+      "k_theta": 502.08,
+      "symmetry_key": "o|cc",
+      "equivalent_patterns": [
+        "coc"
+      ],
+      "count": 2
+    },
+    {
+      "pattern": "coh",
+      "funct": 1,
+      "theta0_deg": 108.5,
+      "k_theta": 460.24,
+      "symmetry_key": "o|ch",
+      "equivalent_patterns": [
+        "coh"
+      ],
+      "count": 2
+    }
+  ],
+  "dihedrals": [
+    {
+      "pattern": "ccoc",
+      "funct": 3,
+      "c": [
+        1.715,
+        2.845,
+        1.046,
+        -5.607,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "ccoc",
+        "cocc"
+      ],
+      "symmetry_key": "ccoc",
+      "count": 4
+    },
+    {
+      "pattern": "ccoh",
+      "funct": 3,
+      "c": [
+        -0.444,
+        3.833,
+        0.728,
+        -4.117,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "hocc"
+      ],
+      "symmetry_key": "ccoh",
+      "count": 2
+    },
+    {
+      "pattern": "coch",
+      "funct": 3,
+      "c": [
+        1.59,
+        4.77,
+        0.0,
+        -6.36,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "hcoc"
+      ],
+      "symmetry_key": "coch",
+      "count": 8
+    },
+    {
+      "pattern": "hcch",
+      "funct": 3,
+      "c": [
+        0.628,
+        1.883,
+        0.0,
+        -2.51,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "hcch"
+      ],
+      "symmetry_key": "hcch",
+      "count": 12
+    },
+    {
+      "pattern": "hcco",
+      "funct": 3,
+      "c": [
+        0.979,
+        2.937,
+        0.0,
+        -3.916,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "hcco"
+      ],
+      "symmetry_key": "hcco",
+      "count": 12
+    },
+    {
+      "pattern": "hcoh",
+      "funct": 3,
+      "c": [
+        0.736,
+        2.209,
+        0.0,
+        -2.946,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "hcoh",
+        "hoch"
+      ],
+      "symmetry_key": "hcoh",
+      "count": 4
+    },
+    {
+      "pattern": "occo",
+      "funct": 3,
+      "c": [
+        -1.151,
+        1.151,
+        0.0,
+        -0.0,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": false,
+      "hydroxyl_variant": "none",
+      "equivalent_patterns": [
+        "occo"
+      ],
+      "symmetry_key": "occo",
+      "count": 1
+    },
+    {
+      "pattern": "occo",
+      "funct": 3,
+      "c": [
+        9.035,
+        -9.035,
+        0.0,
+        -0.0,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": true,
+      "hydroxyl_variant": "end",
+      "equivalent_patterns": [
+        "occo"
+      ],
+      "symmetry_key": "occo",
+      "count": 1
+    },
+    {
+      "pattern": "occo",
+      "funct": 3,
+      "c": [
+        9.035,
+        -9.035,
+        0.0,
+        -0.0,
+        -0.0,
+        0.0
+      ],
+      "terminal_hydroxyl": true,
+      "hydroxyl_variant": "start",
+      "equivalent_patterns": [
+        "occo"
+      ],
+      "symmetry_key": "occo",
+      "count": 1
+    }
+  ]
+}
