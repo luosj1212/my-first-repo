@@ -497,40 +497,6 @@ def compute_bonded_forces(
     except Exception as exc:
         raise RuntimeError("compare_forces.py is required to compute bonded forces") from exc
 
-    def _filter_bonded_topology(top, centre: int):
-        """就地修改 top，仅保留含中心原子的 bond/angle/dihedral 实例。centre 为 0-based。"""
-        # bonds
-        if hasattr(top, "bonds") and top.bonds is not None:
-            keep = []
-            for b in top.bonds:
-                i = b.i - 1
-                j = b.j - 1
-                if i == centre or j == centre:
-                    keep.append(b)
-            top.bonds = keep
-
-        # angles
-        if hasattr(top, "angles") and top.angles is not None:
-            keep = []
-            for a in top.angles:
-                i = a.i - 1
-                j = a.j - 1
-                k = a.k - 1
-                if i == centre or j == centre or k == centre:
-                    keep.append(a)
-            top.angles = keep
-
-        # rb_dihedrals (GROMACS RB-style dihedrals)
-        if hasattr(top, "rb_dihedrals") and top.rb_dihedrals is not None:
-            keep = []
-            for d in top.rb_dihedrals:
-                i = d.i - 1
-                j = d.j - 1
-                k = d.k - 1
-                l = d.l - 1
-                if centre in (i, j, k, l):
-                    keep.append(d)
-            top.rb_dihedrals = keep
 
     def _get_component(contrib: Mapping[str, np.ndarray], names, shape):
         """从 compute_forces 的结果里按多个候选 key 抽一项；没有就返回全 0。"""
@@ -561,7 +527,7 @@ def compute_bonded_forces(
             top = cf.infer_topology_from_summary(summary, coords, entry.atom_types)
 
             # 2) 只保留含中心原子的项，丢掉其它：避免边缘缺参数类型触发错误
-            _filter_bonded_topology(top, c0)
+            # _filter_bonded_topology(top, c0)
 
             # 3) 计算 bonded 力；不算非键
             contrib = cf.compute_forces(
@@ -989,6 +955,96 @@ def build_design_matrix(
 
     return design, targets, pair_index, dih_col_idx
 
+def build_prior_from_summary(
+    pair_type_list: Sequence[Tuple[str, str]],
+    summary: Optional[dict],
+) -> Optional[NDArray[np.float64]]:
+    """
+    根据 summary 里的原始 LJ 参数构造 theta0:
+        theta = [alpha_ij, beta_ij] 按 pair_type_list 顺序展开。
+
+    支持两种常见结构:
+
+    1) dict 形式:
+        summary["nonbond_params"][atomtype]["sigma"/"epsilon"]
+
+    2) list 形式:
+        summary["nonbond_params"] = [
+            {"name" 或 "atom_type" 或 "type": "...", "sigma": ..., "epsilon": ...},
+            ...
+        ]
+    """
+    if summary is None:
+        return None
+
+    nb = summary.get("nonbond_params") or summary.get("lj")
+    if nb is None:
+        return None
+
+    # ---- 统一成 {atomtype: {sigma:.., epsilon:..}} 的 dict ----
+    from collections.abc import Mapping
+
+    if isinstance(nb, Mapping):
+        nb_dict = nb
+    elif isinstance(nb, list):
+        nb_dict: Dict[str, Dict[str, float]] = {}
+        for item in nb:
+            if not isinstance(item, Mapping):
+                continue
+            # 常见几种 key 里挑一个作为类型名
+            key = (
+                item.get("name")
+                or item.get("atom_type")
+                or item.get("type")
+                or item.get("id")
+            )
+            if key is None:
+                continue
+            if "sigma" in item and "epsilon" in item:
+                try:
+                    nb_dict[str(key)] = {
+                        "sigma": float(item["sigma"]),
+                        "epsilon": float(item["epsilon"]),
+                    }
+                except (TypeError, ValueError):
+                    continue
+        nb_dict = nb_dict
+    else:
+        # 不认识的格式，放弃使用先验
+        return None
+
+    if not nb_dict:
+        return None
+
+    prior: list[float] = []
+    for at_i, at_j in pair_type_list:
+        p_i = nb_dict.get(at_i)
+        p_j = nb_dict.get(at_j)
+        if not p_i or not p_j:
+            # 没有完整信息就退回 0，不强加先验
+            prior.extend([0.0, 0.0])
+            continue
+
+        sigma_i = float(p_i["sigma"])
+        epsilon_i = float(p_i["epsilon"])
+        sigma_j = float(p_j["sigma"])
+        epsilon_j = float(p_j["epsilon"])
+
+        # Lorentz–Berthelot
+        sigma_ij = 0.5 * (sigma_i + sigma_j)
+        # 防止奇怪的负/零 epsilon
+        if epsilon_i <= 0.0 or epsilon_j <= 0.0 or sigma_ij <= 0.0:
+            prior.extend([0.0, 0.0])
+            continue
+
+        epsilon_ij = math.sqrt(epsilon_i * epsilon_j)
+
+        alpha_ij = 4.0 * epsilon_ij * (sigma_ij ** 12)
+        beta_ij  = 4.0 * epsilon_ij * (sigma_ij ** 6)
+
+        prior.extend([alpha_ij, beta_ij])
+
+    return np.asarray(prior, dtype=float)
 
 
 def solve_least_squares(
@@ -997,44 +1053,82 @@ def solve_least_squares(
     solver: str,
     alpha: float,
     nonneg: bool,
-) -> Tuple[NDArray[np.float64], Dict[str, float]]:
-    """Solve the linear system with the selected solver."""
+    prior: Optional[NDArray[np.float64]] = None,
+) -> Tuple[NDArray[np.float64], Dict[str, object]]:
+    """
+    解最小二乘问题，并带可选的岭回归正则:
+        min ||A θ - y||^2 + alpha ||θ - prior||^2
 
-    solver = solver.lower()
-    diagnostics: Dict[str, float] = {}
+    如果 prior 为 None，则退化为对 θ 本身的 L2 正则（原来的行为）。
+    """
+    A = np.asarray(design, dtype=float)
+    y = np.asarray(targets, dtype=float)
+    m, n = A.shape
 
-    if design.shape[1] == 0:
-        return np.zeros(0, dtype=float), diagnostics
+    if y.shape[0] != m:
+        raise ValueError(f"design/targets size mismatch: {A.shape} vs {y.shape}")
 
-    if solver == "ridge":
-        if alpha < 0:
-            raise ValueError("Ridge regularisation alpha must be non-negative")
-        if alpha > 0:
-            sqrt_alpha = math.sqrt(alpha)
-            aug_design = np.vstack([design, sqrt_alpha * np.eye(design.shape[1])])
-            aug_targets = np.concatenate([targets, np.zeros(design.shape[1], dtype=float)])
+    # --- 岭回归：在归一化前直接做“伪观测”拼接，保证是在原始坐标系里惩罚 ---
+    if alpha > 0.0:
+        sqrt_alpha = math.sqrt(alpha)
+        if prior is None:
+            prior_vec = np.zeros(n, dtype=float)
         else:
-            aug_design = design
-            aug_targets = targets
+            prior_vec = np.asarray(prior, dtype=float)
+            if prior_vec.shape[0] != n:
+                raise ValueError(
+                    f"prior length mismatch: got {prior_vec.shape[0]}, expected {n}"
+                )
+        # 拼接伪数据点：sqrt(alpha) * (θ - prior) -> A_reg θ ≈ y_reg
+        # A_reg = sqrt(alpha) * I, y_reg = sqrt(alpha) * prior
+        A_reg = sqrt_alpha * np.eye(n, dtype=float)
+        y_reg = sqrt_alpha * prior_vec
+        A = np.vstack([A, A_reg])
+        y = np.concatenate([y, y_reg])
 
-        if nonneg:
-            result = lsq_linear(aug_design, aug_targets, bounds=(0.0, np.inf))
-            theta = result.x
-            diagnostics["optimality"] = float(result.optimality)
-        else:
-            theta, *_ = np.linalg.lstsq(aug_design, aug_targets, rcond=None)
-    elif solver == "qr":
-        if nonneg:
-            result = lsq_linear(design, targets, bounds=(0.0, np.inf))
-            theta = result.x
-            diagnostics["optimality"] = float(result.optimality)
-        else:
-            theta, *_ = np.linalg.lstsq(design, targets, rcond=None)
+    # --- 正常归一化 + 解 ---
+    A_use, y_use, col_scale, y_scale = _normalise_system(A, y)
+
+    diagnostics: Dict[str, object] = {
+        "solver": solver,
+        "alpha": float(alpha),
+        "nonneg": bool(nonneg),
+        "condition": None,
+    }
+
+    if solver == "qr":
+        # 普通最小二乘
+        Q, R = np.linalg.qr(A_use, mode="reduced")
+        theta_norm = np.linalg.solve(R, Q.T @ y_use)
+
+    elif solver == "ridge":
+        # 上面已经把 ridge 变成伪观测拼进 A, y 了，这里就跟 qr 一样解
+        Q, R = np.linalg.qr(A_use, mode="reduced")
+        theta_norm = np.linalg.solve(R, Q.T @ y_use)
+
     elif solver == "nnls":
-        theta, resnorm = nnls(design, targets)
-        diagnostics["residual_norm"] = float(resnorm)
+        # 非负约束：用 nnls 解归一化后的系统
+        if not nonneg:
+            raise ValueError("nnls solver requires nonneg=True")
+        theta_norm, _ = scipy.optimize.nnls(A_use, y_use)
     else:
-        raise ValueError(f"Unsupported solver '{solver}'")
+        raise ValueError(f"Unknown solver: {solver}")
+
+    # 反归一化
+    theta = _denormalise_theta(theta_norm, col_scale, y_scale)
+
+    # 非负裁剪（如果要求 nonneg，且不是 nnls 求出来的）
+    if nonneg and solver != "nnls":
+        theta = np.maximum(theta, 0.0)
+
+    # 一点诊断信息
+    try:
+        ATA = A_use.T @ A_use
+        diagnostics["condition"] = float(
+            np.linalg.cond(ATA)
+        )
+    except Exception:
+        diagnostics["condition"] = None
 
     return theta, diagnostics
 
@@ -1106,6 +1200,7 @@ def evaluate_fit(
 def fit_single_entry(
     entry: ProcessedEntry,
     pairs: Sequence[Mapping[str, object]],
+    summary: Mapping[str, object],
     solver: str,
     alpha: float,
     nonneg: bool,
@@ -1113,7 +1208,7 @@ def fit_single_entry(
     sigma_bounds: Optional[Tuple[float, float]] = None,
     epsilon_bounds: Optional[Tuple[float, float]] = None,
     sigma_soft_weight: float = 0.0,
-    epsilon_soft_weight: float = 0.0,
+    epsilon_soft_weight: float = 0.0, 
 ) -> Dict[str, object]:
     """
     对单个 entry 拟合一组局部 alpha/beta，并应用与 joint 类似的约束逻辑：
@@ -1161,7 +1256,12 @@ def fit_single_entry(
 
     # 正则化 + 线性求解
     A_use, y_use, s_col, s_y = _normalise_system(design, targets)
-    theta_norm, diagnostics = solve_least_squares(A_use, y_use, solver, alpha, nonneg)
+    prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
+
+    theta_norm, diagnostics = solve_least_squares(
+        A_use, y_use, solver, alpha, nonneg, prior=prior
+    )   
+    # theta_norm, diagnostics = solve_least_squares(A_use, y_use, solver, alpha, nonneg)
     theta = _denormalise_theta(theta_norm, s_col, s_y)
 
     # 约束 1：含 H_h 的 pair -> alpha=beta=0（可选）
@@ -1617,7 +1717,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     flush=True,
                 )
         A_use, y_use, s_col, s_y = _normalise_system(design, targets)
-        theta_norm, diagnostics = solve_least_squares(A_use, y_use, args.solver, args.alpha, args.nonneg)
+        prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
+
+        theta_norm, diagnostics = solve_least_squares(A_use, y_use, args.solver, args.alpha, args.nonneg, prior=prior)   
+        # theta_norm, diagnostics = solve_least_squares(A_use, y_use, args.solver, args.alpha, args.nonneg)
         joint_theta = _denormalise_theta(theta_norm, s_col, s_y)
         if args.fit_dihedral and dih_col_idx is not None:
             s_dih = float(joint_theta[dih_col_idx])
@@ -1667,6 +1770,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     epsilon_bounds=(args.epsilon_min, args.epsilon_max),
                     sigma_soft_weight=args.sigma_soft_weight,
                     epsilon_soft_weight=args.epsilon_soft_weight,
+                    summary=summary
                 )
             )
 
@@ -1720,11 +1824,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if design_g.size == 0:
                 continue
 
+
             # 正则化 + 解
             A_g, y_g, s_col_g, s_y_g = _normalise_system(design_g, targets_g)
-            theta_norm_g, diag_g = solve_least_squares(
-                A_g, y_g, args.solver, args.alpha, args.nonneg
-            )
+            prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
+
+            theta_norm_g, diagnostics = solve_least_squares(
+                design,
+                targets,
+                solver=args.solver,
+                alpha=args.alpha,
+                nonneg=args.nonneg,
+                prior=prior,
+            )   
+            # theta_norm_g, diag_g = solve_least_squares(
+            #     A_g, y_g, args.solver, args.alpha, args.nonneg
+            # )
             theta_g = _denormalise_theta(theta_norm_g, s_col_g, s_y_g)
 
             # 可选：强制含 H_h 的 pair 为 0
