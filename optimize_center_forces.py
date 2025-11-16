@@ -77,6 +77,14 @@ class PreparedEntry:
     topology: Topology
     temperature_factor: float
     coords_gpu: Optional[Any] = None
+    atom_param_index: Optional[Any] = None
+    sigma_constant_gpu: Optional[Any] = None
+    epsilon_constant_gpu: Optional[Any] = None
+    bond_force_gpu: Optional[Any] = None
+    angle_force_gpu: Optional[Any] = None
+    coulomb_force_gpu: Optional[Any] = None
+    dihedral_force_gpu: Optional[Any] = None
+    temperature_factor_gpu: Optional[Any] = None
 
 
 def load_json(path: Path) -> Mapping[str, object] | Sequence[object]:
@@ -423,16 +431,19 @@ def _sync_topology_atomtypes(top: Topology, lj_list: Sequence[Mapping[str, objec
         atom_type.epsilon = epsilon
         atom_type.C6 = float(entry.get("C6", 4.0 * epsilon * (sigma ** 6)))
         atom_type.C12 = float(entry.get("C12", 4.0 * epsilon * (sigma ** 12)))
+        atom_type.source_entry_idx = int(idx)
 
 
 def prepare_entries_for_prediction(
     summary: MutableMapping[str, object],
     entries: Sequence[CenterForceEntry],
     device: str,
+    lj_targets: Sequence[OptimisableLJEntry],
 ) -> List[PreparedEntry]:
     prepared: List[PreparedEntry] = []
     use_gpu = device.lower() == "gpu" and torch is not None and torch.cuda.is_available()
     gpu_device = torch.device("cuda") if use_gpu else None
+    target_lookup = {slot.summary_index: idx for idx, slot in enumerate(lj_targets)}
 
     for entry in entries:
         top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
@@ -440,14 +451,51 @@ def prepare_entries_for_prediction(
             atom.charge = float(charge)
         factor = 1.0 / (R_KJ_PER_MOL_K * max(float(entry.temperature), 1e-6))
         coords_gpu = None
+        atom_param_tensor = None
+        sigma_const_tensor = None
+        epsilon_const_tensor = None
+        bond_force_gpu = None
+        angle_force_gpu = None
+        coulomb_force_gpu = None
+        dihedral_force_gpu = None
+        temp_factor_gpu = None
         if use_gpu:
             coords_gpu = torch.as_tensor(entry.coords, dtype=torch.float32, device=gpu_device)
+            atom_param_idx = np.full(len(top.atoms), -1, dtype=np.int64)
+            sigma_const = np.zeros(len(top.atoms), dtype=np.float32)
+            epsilon_const = np.zeros(len(top.atoms), dtype=np.float32)
+            for atom_idx, atom in enumerate(top.atoms):
+                atom_type = top.atomtypes[atom.type_name]
+                source_idx = getattr(atom_type, "source_entry_idx", None)
+                sigma_const[atom_idx] = float(atom_type.sigma)
+                epsilon_const[atom_idx] = float(atom_type.epsilon)
+                if source_idx is None:
+                    continue
+                param_idx = target_lookup.get(int(source_idx))
+                if param_idx is not None:
+                    atom_param_idx[atom_idx] = int(param_idx)
+            atom_param_tensor = torch.as_tensor(atom_param_idx, dtype=torch.long, device=gpu_device)
+            sigma_const_tensor = torch.as_tensor(sigma_const, dtype=torch.float32, device=gpu_device)
+            epsilon_const_tensor = torch.as_tensor(epsilon_const, dtype=torch.float32, device=gpu_device)
+            bond_force_gpu = torch.as_tensor(entry.bond_force_kj, dtype=torch.float32, device=gpu_device)
+            angle_force_gpu = torch.as_tensor(entry.angle_force_kj, dtype=torch.float32, device=gpu_device)
+            coulomb_force_gpu = torch.as_tensor(entry.coulomb_force_kj, dtype=torch.float32, device=gpu_device)
+            dihedral_force_gpu = torch.as_tensor(entry.dihedral_force_kj, dtype=torch.float32, device=gpu_device)
+            temp_factor_gpu = torch.tensor(factor, dtype=torch.float32, device=gpu_device)
         prepared.append(
             PreparedEntry(
                 entry=entry,
                 topology=top,
                 temperature_factor=factor,
                 coords_gpu=coords_gpu,
+                atom_param_index=atom_param_tensor,
+                sigma_constant_gpu=sigma_const_tensor,
+                epsilon_constant_gpu=epsilon_const_tensor,
+                bond_force_gpu=bond_force_gpu,
+                angle_force_gpu=angle_force_gpu,
+                coulomb_force_gpu=coulomb_force_gpu,
+                dihedral_force_gpu=dihedral_force_gpu,
+                temperature_factor_gpu=temp_factor_gpu,
             )
         )
     return prepared
@@ -489,6 +537,9 @@ def compute_nonbonded_forces(
     do_lj: bool = True,
     do_coul: bool = True,
     device: str = "gpu",
+    sigma_override=None,
+    epsilon_override=None,
+    return_numpy: bool = True,
 ) -> np.ndarray:
     """
     只计算非键相互作用的力 (LJ / 库伦)，单位 kJ/mol/nm。
@@ -497,7 +548,19 @@ def compute_nonbonded_forces(
     """
 
     if device.lower() == "gpu":
-        return _compute_nonbonded_forces_gpu(top, coords_in, rcoul, rvdw, do_lj, do_coul)
+        return _compute_nonbonded_forces_gpu(
+            top,
+            coords_in,
+            rcoul,
+            rvdw,
+            do_lj,
+            do_coul,
+            sigma_override=sigma_override,
+            epsilon_override=epsilon_override,
+            return_numpy=return_numpy,
+        )
+    if not return_numpy:
+        raise ValueError("CPU nonbonded force evaluation only supports numpy outputs")
     return _compute_nonbonded_forces_cpu(top, coords_in, rcoul, rvdw, do_lj, do_coul)
 
 
@@ -579,7 +642,11 @@ def _compute_nonbonded_forces_gpu(
     rvdw: float,
     do_lj: bool,
     do_coul: bool,
-) -> np.ndarray:
+    *,
+    sigma_override=None,
+    epsilon_override=None,
+    return_numpy: bool = True,
+):
     if torch is None:
         raise RuntimeError("GPU acceleration requires torch to be installed")
     if not torch.cuda.is_available():
@@ -587,79 +654,86 @@ def _compute_nonbonded_forces_gpu(
 
     device = torch.device("cuda")
     dtype = torch.float32
-    with torch.no_grad():
-        if isinstance(coords_in, torch.Tensor):
-            coords = coords_in.to(device=device, dtype=dtype)
-        else:
-            coords = torch.as_tensor(np.asarray(coords_in, dtype=float), dtype=dtype, device=device)
-        n = coords.shape[0]
-        forces = torch.zeros_like(coords)
+    if isinstance(coords_in, torch.Tensor):
+        coords = coords_in.to(device=device, dtype=dtype)
+    else:
+        coords = torch.as_tensor(np.asarray(coords_in, dtype=float), dtype=dtype, device=device)
+    n = coords.shape[0]
+    forces = torch.zeros_like(coords)
 
-        charges = torch.tensor([a.charge for a in top.atoms], dtype=dtype, device=device)
+    charges = torch.tensor([a.charge for a in top.atoms], dtype=dtype, device=device)
+    if sigma_override is not None:
+        sigma = sigma_override.to(device=device, dtype=dtype)
+    else:
         sigma = torch.tensor([top.atomtypes[a.type_name].sigma for a in top.atoms], dtype=dtype, device=device)
+    if epsilon_override is not None:
+        epsilon = epsilon_override.to(device=device, dtype=dtype)
+    else:
         epsilon = torch.tensor([top.atomtypes[a.type_name].epsilon for a in top.atoms], dtype=dtype, device=device)
 
-        exclusion_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
-        for i, j in build_exclusions(top):
-            i0, j0 = i - 1, j - 1
-            exclusion_mask[i0, j0] = True
-            exclusion_mask[j0, i0] = True
+    exclusion_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+    for i, j in build_exclusions(top):
+        i0, j0 = i - 1, j - 1
+        exclusion_mask[i0, j0] = True
+        exclusion_mask[j0, i0] = True
 
-        pair14_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
-        for i, j in top.pairs14:
-            i0, j0 = i - 1, j - 1
-            pair14_mask[i0, j0] = True
-            pair14_mask[j0, i0] = True
+    pair14_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+    for i, j in top.pairs14:
+        i0, j0 = i - 1, j - 1
+        pair14_mask[i0, j0] = True
+        pair14_mask[j0, i0] = True
 
-        diff = coords[:, None, :] - coords[None, :, :]
-        r2 = torch.sum(diff * diff, dim=-1)
-        triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
-        valid_mask = triu_mask & (r2 >= 1e-24)
+    diff = coords[:, None, :] - coords[None, :, :]
+    r2 = torch.sum(diff * diff, dim=-1)
+    triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
+    valid_mask = triu_mask & (r2 >= 1e-24)
 
-        if do_lj and rvdw > 0:
-            dist = torch.sqrt(torch.clamp(r2, min=1e-24))
-            mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
-            if torch.any(mask):
-                sig = torch.sqrt(sigma[:, None] * sigma[None, :])
-                eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
-                c6 = 4.0 * eps * (sig ** 6)
-                c12 = 4.0 * eps * (sig ** 12)
-                c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
-                c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
+    if do_lj and rvdw > 0:
+        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+        mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
+        if torch.any(mask):
+            sig = torch.sqrt(sigma[:, None] * sigma[None, :])
+            eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
+            c6 = 4.0 * eps * (sig ** 6)
+            c12 = 4.0 * eps * (sig ** 12)
+            c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
+            c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
 
-                c6_vals = c6[mask]
-                c12_vals = c12[mask]
-                r2_vals = r2[mask]
-                dvec = diff[mask]
+            c6_vals = c6[mask]
+            c12_vals = c12[mask]
+            r2_vals = r2[mask]
+            dvec = diff[mask]
 
-                invr2 = 1.0 / r2_vals
-                invr6 = invr2 ** 3
-                invr12 = invr6 ** 2
-                coef = (12.0 * c12_vals * invr12 - 6.0 * c6_vals * invr6) * invr2
-                pair_forces = -coef[:, None] * dvec
+            invr2 = 1.0 / r2_vals
+            invr6 = invr2 ** 3
+            invr12 = invr6 ** 2
+            coef = (12.0 * c12_vals * invr12 - 6.0 * c6_vals * invr6) * invr2
+            pair_forces = -coef[:, None] * dvec
 
-                pairs = torch.nonzero(mask, as_tuple=False)
-                forces.index_add_(0, pairs[:, 0], pair_forces)
-                forces.index_add_(0, pairs[:, 1], -pair_forces)
+            pairs = torch.nonzero(mask, as_tuple=False)
+            forces.index_add_(0, pairs[:, 0], pair_forces)
+            forces.index_add_(0, pairs[:, 1], -pair_forces)
 
-        if do_coul and rcoul > 0:
-            dist = torch.sqrt(torch.clamp(r2, min=1e-24))
-            mask = valid_mask & (~exclusion_mask) & (dist < rcoul)
-            if torch.any(mask):
-                qq = charges[:, None] * charges[None, :]
-                qq = torch.where(pair14_mask, qq * top.fudgeQQ, qq)
-                qq_vals = qq[mask]
-                r_vals = dist[mask]
-                invr = 1.0 / r_vals
-                coef = KELEC * qq_vals * (invr ** 3)
-                dvec = diff[mask]
-                pair_forces = -coef[:, None] * dvec
+    if do_coul and rcoul > 0:
+        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+        mask = valid_mask & (~exclusion_mask) & (dist < rcoul)
+        if torch.any(mask):
+            qq = charges[:, None] * charges[None, :]
+            qq = torch.where(pair14_mask, qq * top.fudgeQQ, qq)
+            qq_vals = qq[mask]
+            r_vals = dist[mask]
+            invr = 1.0 / r_vals
+            coef = KELEC * qq_vals * (invr ** 3)
+            dvec = diff[mask]
+            pair_forces = -coef[:, None] * dvec
 
-                pairs = torch.nonzero(mask, as_tuple=False)
-                forces.index_add_(0, pairs[:, 0], pair_forces)
-                forces.index_add_(0, pairs[:, 1], -pair_forces)
+            pairs = torch.nonzero(mask, as_tuple=False)
+            forces.index_add_(0, pairs[:, 0], pair_forces)
+            forces.index_add_(0, pairs[:, 1], -pair_forces)
 
+    if return_numpy:
         return forces.detach().cpu().numpy()
+    return forces
 
 
 def compute_dihedral_forces(
@@ -735,6 +809,74 @@ def compute_dihedral_forces(
 
     return forces
 
+
+def _assemble_atomwise_lj_parameters(
+    prepared: PreparedEntry,
+    sigma_params: "torch.Tensor",
+    epsilon_params: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    if torch is None:
+        raise RuntimeError("Torch is required for GPU LJ assembly")
+    if (
+        prepared.atom_param_index is None
+        or prepared.sigma_constant_gpu is None
+        or prepared.epsilon_constant_gpu is None
+    ):
+        raise RuntimeError("Prepared entry missing GPU parameter metadata")
+    sigma_atoms = prepared.sigma_constant_gpu.clone()
+    epsilon_atoms = prepared.epsilon_constant_gpu.clone()
+    mask = prepared.atom_param_index >= 0
+    if torch.any(mask):
+        gather_idx = prepared.atom_param_index[mask]
+        sigma_atoms[mask] = sigma_params[gather_idx]
+        epsilon_atoms[mask] = epsilon_params[gather_idx]
+    return sigma_atoms, epsilon_atoms
+
+
+def predict_forces_gpu_params(
+    prepared_entries: Sequence[PreparedEntry],
+    sigma_params: "torch.Tensor",
+    epsilon_params: "torch.Tensor",
+    rvdw: float,
+) -> "torch.Tensor":
+    if torch is None:
+        raise RuntimeError("Torch is required for GPU prediction")
+    predictions: List["torch.Tensor"] = []
+    for prepared in prepared_entries:
+        if prepared.coords_gpu is None:
+            raise RuntimeError("Prepared entry missing GPU coordinates")
+        sigma_atoms, epsilon_atoms = _assemble_atomwise_lj_parameters(
+            prepared, sigma_params, epsilon_params
+        )
+        forces_lj = _compute_nonbonded_forces_gpu(
+            prepared.topology,
+            prepared.coords_gpu,
+            rcoul=0.0,
+            rvdw=rvdw,
+            do_lj=True,
+            do_coul=False,
+            sigma_override=sigma_atoms,
+            epsilon_override=epsilon_atoms,
+            return_numpy=False,
+        )
+        idx = prepared.entry.center_index
+        if (
+            prepared.coulomb_force_gpu is None
+            or prepared.dihedral_force_gpu is None
+            or prepared.bond_force_gpu is None
+            or prepared.angle_force_gpu is None
+            or prepared.temperature_factor_gpu is None
+        ):
+            raise RuntimeError("Prepared entry missing GPU cached forces")
+        total_nb = (
+            forces_lj[idx]
+            + prepared.coulomb_force_gpu
+            + prepared.dihedral_force_gpu
+        )
+        total_kj = total_nb + prepared.bond_force_gpu + prepared.angle_force_gpu
+        predictions.append(total_kj * prepared.temperature_factor_gpu)
+    return torch.stack(predictions)
+
 def predict_forces(
     summary: MutableMapping[str, object],
     prepared_entries: Sequence[PreparedEntry],
@@ -783,6 +925,109 @@ def predict_forces(
         predictions.append(total_kj * prepared.temperature_factor)
 
     return np.vstack(predictions)
+
+
+def run_gpu_optimizer(
+    prepared_entries: Sequence[PreparedEntry],
+    targets_np: NDArray[np.float32],
+    sigma0: NDArray[np.float32],
+    epsilon0: NDArray[np.float32],
+    args: argparse.Namespace,
+    logger: OptimisationLogger,
+) -> Tuple[NDArray[np.float32], NDArray[np.float32], Dict[str, object]]:
+    if torch is None:
+        raise RuntimeError("Torch is required for GPU optimisation")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA device is not available for GPU optimisation")
+    device = torch.device("cuda")
+    targets = torch.as_tensor(targets_np, dtype=torch.float32, device=device)
+    sigma_param = torch.nn.Parameter(torch.tensor(sigma0, dtype=torch.float32, device=device))
+    epsilon_param = torch.nn.Parameter(torch.tensor(epsilon0, dtype=torch.float32, device=device))
+    optimizer = torch.optim.Adam([sigma_param, epsilon_param], lr=float(args.learning_rate))
+    early_stopper = EarlyStopping(
+        patience=int(args.patience), initial_loss=float("inf"), min_delta=1e-9
+    )
+    best_sigma = sigma0.copy()
+    best_epsilon = epsilon0.copy()
+    best_loss = float("inf")
+
+    for iteration in range(1, int(args.max_iter) + 1):
+        optimizer.zero_grad()
+        sigma_clamped = torch.clamp(
+            sigma_param, min=float(args.sigma_min), max=float(args.sigma_max)
+        )
+        epsilon_clamped = torch.clamp(
+            epsilon_param, min=float(args.epsilon_min), max=float(args.epsilon_max)
+        )
+
+        preds = predict_forces_gpu_params(
+            prepared_entries, sigma_clamped, epsilon_clamped, args.rvdw
+        )
+
+        # ---- NaN / Inf 检查：预测值 ----
+        if not torch.isfinite(preds).all():
+            print(f"[ERROR] NaN/Inf 出现在 preds (iter={iteration})")
+            print("sigma_clamped =", sigma_clamped.detach().cpu().numpy())
+            print("epsilon_clamped =", epsilon_clamped.detach().cpu().numpy())
+            break
+
+        loss_tensor = torch.mean((preds - targets) ** 2)
+
+        # ---- NaN / Inf 检查：loss ----
+        if not torch.isfinite(loss_tensor):
+            print(f"[ERROR] NaN/Inf 出现在 loss (iter={iteration})")
+            print("sigma_clamped =", sigma_clamped.detach().cpu().numpy())
+            print("epsilon_clamped =", epsilon_clamped.detach().cpu().numpy())
+            break
+
+        loss_tensor.backward()
+
+        # ---- NaN / Inf 检查：梯度 ----
+        for name, p in [("sigma", sigma_param), ("epsilon", epsilon_param)]:
+            if p.grad is not None and not torch.isfinite(p.grad).all():
+                print(f"[ERROR] NaN/Inf 出现在 {name}.grad (iter={iteration})")
+                print(f"{name}_clamped =", p.detach().cpu().numpy())
+                break
+
+        optimizer.step()
+
+        loss_value = float(loss_tensor.item())
+        logger.eval_counter += 1
+
+        if loss_value + 1e-12 < best_loss:
+            best_loss = loss_value
+            best_sigma = sigma_clamped.detach().cpu().numpy()
+            best_epsilon = epsilon_clamped.detach().cpu().numpy()
+
+        if logger.eval_counter % max(int(args.log_interval), 1) == 0:
+            pred_np = preds.detach().cpu().numpy()
+            metrics = compute_metrics(pred_np, targets_np)
+            logger.log(
+                "iteration",
+                metrics,
+                logger.snapshot_params(
+                    sigma_clamped.detach().cpu().numpy(),
+                    epsilon_clamped.detach().cpu().numpy(),
+                ),
+                iteration=logger.eval_counter,
+            )
+
+        if early_stopper.best_loss is math.inf:
+            early_stopper.best_loss = loss_value
+        if early_stopper.update(loss_value):
+            print(
+                f"[EARLY STOP GPU] No improvement for {args.patience} steps; stopping optimisation."
+            )
+            break
+
+    meta = {
+        "method": "TorchAdam",
+        "success": True,
+        "message": "GPU optimisation completed",
+        "nfev": int(logger.eval_counter),
+        "nit": int(logger.eval_counter),
+    }
+    return best_sigma, best_epsilon, meta
 
 def compute_metrics(pred: NDArray[np.float32], target: NDArray[np.float32]) -> Dict[str, Dict[str, float]]:
     diff = pred - target
@@ -926,6 +1171,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="gpu",
         help="Device for LJ force evaluation (GPU requires torch with CUDA)",
     )
+    parser.add_argument("--learning-rate", type=float, default=1e-2, help="Learning rate for the GPU optimiser")
+    parser.add_argument("--patience", type=int, default=500, help="Early stopping patience for both optimisers")
+    parser.add_argument("--log-interval", type=int, default=5, help="Iterations between optimisation log entries")
     return parser.parse_args(argv)
 
 
@@ -980,7 +1228,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_lj_parameters(summary, lj_targets, sigma0, epsilon0)
     targets = np.vstack([entry.target_force for entry in entries])
 
-    prepared_entries = prepare_entries_for_prediction(summary, entries, device=args.device)
+    prepared_entries = prepare_entries_for_prediction(
+        summary, entries, device=args.device, lj_targets=lj_targets
+    )
     refresh_prepared_topologies(prepared_entries, summary)
 
     logger = OptimisationLogger([item.label for item in lj_targets])
@@ -994,79 +1244,98 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     initial_metrics = compute_metrics(initial_pred, targets)
     logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0))
 
-    bounds: List[Tuple[float, float]] = []
-    for _ in lj_targets:
-        bounds.append((args.sigma_min, args.sigma_max))
-    for _ in lj_targets:
-        bounds.append((args.epsilon_min, args.epsilon_max))
-
-    def _pack(s: NDArray[np.float32], e: NDArray[np.float32]) -> NDArray[np.float32]:
-        return np.concatenate([s, e])
-
-    def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
-        vec = np.asarray(vec, dtype=float)
-        n = len(lj_targets)
-        return vec[:n], vec[n:]
-
-    best_state = {
-        "loss": float(initial_metrics["loss"]["total"]),
-        "vec": _pack(sigma0, epsilon0),
-    }
-    patience = 500
-    early_stopper = EarlyStopping(
-        patience=patience, initial_loss=best_state["loss"], min_delta=1e-9
+    use_gpu_optimizer = (
+        args.device.lower() == "gpu" and torch is not None and torch.cuda.is_available()
     )
-
-    def objective(vec: Sequence[float]) -> float:
-        sigma, epsilon = _unpack(vec)
-        apply_lj_parameters(summary, lj_targets, sigma, epsilon)
-        refresh_prepared_topologies(prepared_entries, summary)
-        pred = predict_forces(
-            summary,
+    result_meta: Dict[str, object]
+    if use_gpu_optimizer:
+        sigma_opt, epsilon_opt, result_meta = run_gpu_optimizer(
             prepared_entries,
-            rvdw=args.rvdw,
-            device=args.device,
+            targets,
+            sigma0,
+            epsilon0,
+            args,
+            logger,
         )
-        metrics = compute_metrics(pred, targets)
-        logger.eval_counter += 1
-    # 每 5 次打印一次
-        if logger.eval_counter % 5 == 0:
-            logger.log(
-                "iteration",
-                metrics,
-                logger.snapshot_params(sigma, epsilon),
-                iteration=logger.eval_counter,
+    else:
+        bounds: List[Tuple[float, float]] = []
+        for _ in lj_targets:
+            bounds.append((args.sigma_min, args.sigma_max))
+        for _ in lj_targets:
+            bounds.append((args.epsilon_min, args.epsilon_max))
+
+        def _pack(s: NDArray[np.float32], e: NDArray[np.float32]) -> NDArray[np.float32]:
+            return np.concatenate([s, e])
+
+        def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
+            vec = np.asarray(vec, dtype=float)
+            n = len(lj_targets)
+            return vec[:n], vec[n:]
+
+        best_state = {
+            "loss": float(initial_metrics["loss"]["total"]),
+            "vec": _pack(sigma0, epsilon0),
+        }
+        early_stopper = EarlyStopping(
+            patience=int(args.patience), initial_loss=best_state["loss"], min_delta=1e-9
+        )
+
+        def objective(vec: Sequence[float]) -> float:
+            sigma, epsilon = _unpack(vec)
+            apply_lj_parameters(summary, lj_targets, sigma, epsilon)
+            refresh_prepared_topologies(prepared_entries, summary)
+            pred = predict_forces(
+                summary,
+                prepared_entries,
+                rvdw=args.rvdw,
+                device=args.device,
+            )
+            metrics = compute_metrics(pred, targets)
+            logger.eval_counter += 1
+            if logger.eval_counter % max(int(args.log_interval), 1) == 0:
+                logger.log(
+                    "iteration",
+                    metrics,
+                    logger.snapshot_params(sigma, epsilon),
+                    iteration=logger.eval_counter,
+                )
+
+            loss_value = metrics["loss"]["total"]
+            if loss_value < best_state["loss"] - 1e-12:
+                best_state["loss"] = loss_value
+                best_state["vec"] = _pack(sigma, epsilon)
+            if early_stopper.update(loss_value):
+                raise EarlyStopException(
+                    f"No improvement for {args.patience} evaluations; stopping early."
+                )
+            return loss_value
+
+        try:
+            result = minimize(
+                objective,
+                _pack(sigma0, epsilon0),
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": args.max_iter, "disp": True},
+            )
+        except EarlyStopException as exc:
+            print(f"[EARLY STOP] {exc}")
+            result = SimpleNamespace(
+                x=best_state["vec"],
+                success=False,
+                message=str(exc),
+                nfev=int(logger.eval_counter),
+                nit=int(logger.eval_counter),
             )
 
-        loss_value = metrics["loss"]["total"]
-        if loss_value < best_state["loss"] - 1e-12:
-            best_state["loss"] = loss_value
-            best_state["vec"] = _pack(sigma, epsilon)
-        if early_stopper.update(loss_value):
-            raise EarlyStopException(
-                f"No improvement for {patience} evaluations; stopping early."
-            )
-        return loss_value
-
-    try:
-        result = minimize(
-            objective,
-            _pack(sigma0, epsilon0),
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": args.max_iter, "disp": True},
-        )
-    except EarlyStopException as exc:
-        print(f"[EARLY STOP] {exc}")
-        result = SimpleNamespace(
-            x=best_state["vec"],
-            success=False,
-            message=str(exc),
-            nfev=int(logger.eval_counter),
-            nit=int(logger.eval_counter),
-        )
-
-    sigma_opt, epsilon_opt = _unpack(best_state["vec"])
+        sigma_opt, epsilon_opt = _unpack(best_state["vec"])
+        result_meta = {
+            "method": "L-BFGS-B",
+            "success": bool(result.success),
+            "message": result.message,
+            "nfev": int(result.nfev),
+            "nit": int(result.nit),
+        }
     apply_lj_parameters(summary, lj_targets, sigma_opt, epsilon_opt)
     refresh_prepared_topologies(prepared_entries, summary)
     final_pred = predict_forces(
@@ -1083,13 +1352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         fh.write("\n")
 
     log_payload = {
-        "meta": {
-            "method": "L-BFGS-B",
-            "success": bool(result.success),
-            "message": result.message,
-            "nfev": int(result.nfev),
-            "nit": int(result.nit),
-        },
+        "meta": result_meta,
         "history": logger.records,
     }
     with args.log.open("w", encoding="utf-8") as fh:
