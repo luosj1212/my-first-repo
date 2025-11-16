@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency guard
     import numpy as np
@@ -22,6 +24,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - clearer error when miss
     raise SystemExit(
         "optimize_center_forces.py requires SciPy. Please install scipy before running this script."
     ) from exc
+
+try:  # pragma: no cover - optional dependency guard
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - torch is optional unless GPU is requested
+    torch = None
 
 from compare_forces import (
     KELEC,
@@ -47,6 +54,12 @@ class CenterForceEntry:
     bond_force_kj: NDArray[np.float64]
     angle_force_kj: NDArray[np.float64]
     box: NDArray[np.float64]
+    coulomb_force_kj: NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros(3, dtype=float)
+    )
+    dihedral_force_kj: NDArray[np.float64] = field(
+        default_factory=lambda: np.zeros(3, dtype=float)
+    )
 
 
 @dataclass
@@ -63,8 +76,6 @@ def load_json(path: Path) -> Mapping[str, object] | Sequence[object]:
 
 
 def load_force_map(csv_path: Path, label: str) -> Dict[Tuple[str, int], NDArray[np.float64]]:
-    import csv
-
     fmap: Dict[Tuple[str, int], NDArray[np.float64]] = {}
     if not csv_path.is_file():
         print(f"[load_{label}] WARNING: {csv_path} not found; defaulting to zeros")
@@ -90,6 +101,54 @@ def load_force_map(csv_path: Path, label: str) -> Dict[Tuple[str, int], NDArray[
 
     print(f"[load_{label}] entries: {len(fmap)} from {csv_path}")
     return fmap
+
+
+def cache_force_component(
+    entries: Sequence[CenterForceEntry],
+    summary: MutableMapping[str, object],
+    csv_path: Path,
+    label: str,
+    compute_fn: Callable[[Topology, NDArray[np.float64]], NDArray[np.float64]],
+) -> Dict[Tuple[str, int], NDArray[np.float64]]:
+    if csv_path.is_file():
+        return load_force_map(csv_path, label)
+
+    rows: List[Dict[str, object]] = []
+    cache: Dict[Tuple[str, int], NDArray[np.float64]] = {}
+    for entry in entries:
+        top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
+        for atom, charge in zip(top.atoms, entry.charges):
+            atom.charge = float(charge)
+        forces = np.asarray(compute_fn(top, entry.coords), dtype=float)
+        vec = forces[entry.center_index]
+        cache[(entry.gro_file, entry.center_index)] = vec
+        rows.append(
+            {
+                "gro_file": entry.gro_file,
+                "center_index": entry.center_index,
+                "Fx": vec[0],
+                "Fy": vec[1],
+                "Fz": vec[2],
+            }
+        )
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["gro_file", "center_index", "Fx", "Fy", "Fz"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[cache_{label}] wrote {len(rows)} entries to {csv_path}")
+    return cache
+
+
+def apply_cached_component(
+    entries: Sequence[CenterForceEntry],
+    cache: Mapping[Tuple[str, int], NDArray[np.float64]],
+    attr: str,
+) -> None:
+    for entry in entries:
+        vec = np.asarray(cache.get((entry.gro_file, entry.center_index), np.zeros(3)), dtype=float)
+        setattr(entry, attr, vec)
 
 
 def _infer_center_index(entry: Mapping[str, object]) -> Optional[int]:
@@ -152,7 +211,7 @@ def build_entries(
         if limit is not None and len(entries) >= limit:
             break
         status = str(item.get("center_force_status", "")).lower()
-        if status and status not in {"ok", "good", "done"}:
+        if status and status not in {"ok", "good", "done", "already has force"}:
             continue
 
         # 先读坐标（后面要用来按坐标找中心原子）
@@ -255,6 +314,69 @@ def build_entries(
         )
     return entries
 
+from collections import Counter
+
+def debug_filtering(
+    data: Sequence[Mapping[str, object]],
+    bond_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
+    angle_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
+    limit: Optional[int] = None,
+) -> None:
+    stats = Counter()
+
+    for idx, item in enumerate(data):
+        if limit is not None and stats["kept"] >= limit:
+            break
+
+        stats["total"] += 1
+
+        # 1) status 过滤
+        status = str(item.get("center_force_status", "")).lower()
+        if status and status not in {"ok", "good", "done"}:
+            stats["bad_status"] += 1
+            continue
+
+        # 2) 坐标检查
+        coords = np.asarray(item.get("coordinates"), dtype=float)
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            stats["bad_coords"] += 1
+            continue
+
+        gro_file = str(item.get("gro_file", f"entry_{idx}.gro"))
+        entry_id = f"{gro_file} (entry {idx})"
+
+        # 3) 通过坐标找中心
+        center_atom = item.get("center_atom", {})
+        center_idx_coords: Optional[int] = None
+        try:
+            center_idx_coords = _find_center_index_by_coords(coords, center_atom, entry_id=entry_id)
+        except Exception:
+            pass
+
+        # 4) 从 JSON 字段猜中心 index
+        center_idx_json: Optional[int] = _infer_center_index(item)
+
+        if center_idx_coords is not None:
+            center_index = center_idx_coords
+        else:
+            center_index = center_idx_json
+
+        if center_index is None:
+            stats["no_center_index"] += 1
+            continue
+
+        # 5) 看 CSV 里有没有对应的条目
+        if (gro_file, center_index) not in bond_forces:
+            stats["no_bond_force_in_csv"] += 1
+        if (gro_file, center_index) not in angle_forces:
+            stats["no_angle_force_in_csv"] += 1
+
+        stats["kept"] += 1
+
+    print("=== Filter stats ===")
+    for k, v in stats.items():
+        print(f"{k:25s}: {v}")
+
 
 def select_optimisable_lj(summary: MutableMapping[str, object], fix_hydroxyl_h: bool = True) -> List[OptimisableLJEntry]:
     entries: List[OptimisableLJEntry] = []
@@ -303,11 +425,27 @@ def compute_nonbonded_forces(
     rvdw: float = 1.2,
     do_lj: bool = True,
     do_coul: bool = True,
+    device: str = "gpu",
 ) -> np.ndarray:
     """
     只计算非键相互作用的力 (LJ / 库伦)，单位 kJ/mol/nm。
     使用 do_lj / do_coul 控制是否计算对应项。
+    device="gpu" 时使用 PyTorch + CUDA 对 LJ/库伦求和进行矢量化加速。
     """
+
+    if device.lower() == "gpu":
+        return _compute_nonbonded_forces_gpu(top, coords_in, rcoul, rvdw, do_lj, do_coul)
+    return _compute_nonbonded_forces_cpu(top, coords_in, rcoul, rvdw, do_lj, do_coul)
+
+
+def _compute_nonbonded_forces_cpu(
+    top: Topology,
+    coords_in,
+    rcoul: float,
+    rvdw: float,
+    do_lj: bool,
+    do_coul: bool,
+) -> np.ndarray:
     coords = np.asarray(coords_in, dtype=float)
     n = coords.shape[0]
     forces = np.zeros_like(coords)
@@ -321,7 +459,7 @@ def compute_nonbonded_forces(
 
     for i in range(n - 1):
         ri = coords[i]
-        diff = coords[i + 1:] - ri                      # (m,3)
+        diff = coords[i + 1:] - ri
         j_idx_all = np.arange(i + 1, n)
         r2_all = np.einsum("ij,ij->i", diff, diff)
         mask = r2_all >= 1e-24
@@ -341,7 +479,6 @@ def compute_nonbonded_forces(
             excluded = pair in exclusions
             is14 = pair in pairs14
 
-            # LJ
             if do_lj and (not excluded) and dist < rvdw:
                 sig = math.sqrt(sigma[i] * sigma[j])
                 eps = math.sqrt(epsilon[i] * epsilon[j])
@@ -359,7 +496,6 @@ def compute_nonbonded_forces(
                 forces[i] += f
                 forces[j] -= f
 
-            # Coulomb
             if do_coul and (not excluded) and dist < rcoul:
                 qq = charges[i] * charges[j]
                 if is14:
@@ -371,6 +507,92 @@ def compute_nonbonded_forces(
                 forces[j] -= f
 
     return forces
+
+
+def _compute_nonbonded_forces_gpu(
+    top: Topology,
+    coords_in,
+    rcoul: float,
+    rvdw: float,
+    do_lj: bool,
+    do_coul: bool,
+) -> np.ndarray:
+    if torch is None:
+        raise RuntimeError("GPU acceleration requires torch to be installed")
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU acceleration requested but CUDA device is not available")
+
+    device = torch.device("cuda")
+    dtype = torch.float64
+    coords = torch.as_tensor(np.asarray(coords_in, dtype=float), dtype=dtype, device=device)
+    n = coords.shape[0]
+    forces = torch.zeros_like(coords)
+
+    charges = torch.tensor([a.charge for a in top.atoms], dtype=dtype, device=device)
+    sigma = torch.tensor([top.atomtypes[a.type_name].sigma for a in top.atoms], dtype=dtype, device=device)
+    epsilon = torch.tensor([top.atomtypes[a.type_name].epsilon for a in top.atoms], dtype=dtype, device=device)
+
+    exclusion_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+    for i, j in build_exclusions(top):
+        i0, j0 = i - 1, j - 1
+        exclusion_mask[i0, j0] = True
+        exclusion_mask[j0, i0] = True
+
+    pair14_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+    for i, j in top.pairs14:
+        i0, j0 = i - 1, j - 1
+        pair14_mask[i0, j0] = True
+        pair14_mask[j0, i0] = True
+
+    diff = coords[:, None, :] - coords[None, :, :]
+    r2 = torch.sum(diff * diff, dim=-1)
+    triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
+    valid_mask = triu_mask & (r2 >= 1e-24)
+
+    if do_lj and rvdw > 0:
+        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+        mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
+        if torch.any(mask):
+            sig = torch.sqrt(sigma[:, None] * sigma[None, :])
+            eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
+            c6 = 4.0 * eps * (sig ** 6)
+            c12 = 4.0 * eps * (sig ** 12)
+            c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
+            c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
+
+            c6_vals = c6[mask]
+            c12_vals = c12[mask]
+            r2_vals = r2[mask]
+            dvec = diff[mask]
+
+            invr2 = 1.0 / r2_vals
+            invr6 = invr2 ** 3
+            invr12 = invr6 ** 2
+            coef = (12.0 * c12_vals * invr12 - 6.0 * c6_vals * invr6) * invr2
+            pair_forces = -coef[:, None] * dvec
+
+            pairs = torch.nonzero(mask, as_tuple=False)
+            forces.index_add_(0, pairs[:, 0], pair_forces)
+            forces.index_add_(0, pairs[:, 1], -pair_forces)
+
+    if do_coul and rcoul > 0:
+        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+        mask = valid_mask & (~exclusion_mask) & (dist < rcoul)
+        if torch.any(mask):
+            qq = charges[:, None] * charges[None, :]
+            qq = torch.where(pair14_mask, qq * top.fudgeQQ, qq)
+            qq_vals = qq[mask]
+            r_vals = dist[mask]
+            invr = 1.0 / r_vals
+            coef = KELEC * qq_vals * (invr ** 3)
+            dvec = diff[mask]
+            pair_forces = -coef[:, None] * dvec
+
+            pairs = torch.nonzero(mask, as_tuple=False)
+            forces.index_add_(0, pairs[:, 0], pair_forces)
+            forces.index_add_(0, pairs[:, 1], -pair_forces)
+
+    return forces.detach().cpu().numpy()
 
 
 def compute_dihedral_forces(
@@ -449,15 +671,15 @@ def compute_dihedral_forces(
 def predict_forces(
     summary: MutableMapping[str, object],
     entries: Sequence[CenterForceEntry],
-    rcoul: float,
     rvdw: float,
+    device: str = "cpu",
 ) -> NDArray[np.float64]:
     """
     用和 compare_plot_csv.py 一致的方式计算预测力。
 
-    - LJ：compute_nonbonded_forces(..., do_lj=True,  do_coul=False, rvdw=rvdw, rcoul=0)
-    - COUL：compute_nonbonded_forces(..., do_lj=False, do_coul=True,  rvdw=0,    rcoul=rcoul)
-    - DIH：compute_dihedral_forces(...)
+    - LJ：compute_nonbonded_forces(..., do_lj=True, do_coul=False, rvdw=rvdw, rcoul=0)
+    - COUL：来自缓存的 CSV（单位 kJ/mol/nm）
+    - DIH：来自缓存的 CSV（单位 kJ/mol/nm）
     - 再加 bond / angle（来自 CSV，单位 kJ/mol/nm）
     - 最后结果转成 kBT/nm
     """
@@ -484,31 +706,14 @@ def predict_forces(
             do_coul=False,
         )
 
-        # 4. Coulomb 力：只算库仑，不算 LJ
-        forces_coul_kj = compute_nonbonded_forces(
-            top,
-            entry.coords,
-            rcoul=rcoul,    # 库仑截断
-            rvdw=0.0,       # 不算 LJ
-            do_lj=False,
-            do_coul=True,
-        )
-
-        # 5. Dihedral 力
-        forces_dih_kj = compute_dihedral_forces(top, entry.coords)
-
-        # 6. 在中心原子上把三项加起来，再加 bond/angle
+        # 4. 在中心原子上把各项加起来（库伦 / 二面角来自缓存）
         idx = entry.center_index
         total_nb_kj = (
             forces_lj_kj[idx]
-            + forces_coul_kj[idx]
-            + forces_dih_kj[idx]
+            + entry.coulomb_force_kj
+            + entry.dihedral_force_kj
         )
-        total_kj = (
-            total_nb_kj
-            + entry.bond_force_kj
-            + entry.angle_force_kj
-        )
+        total_kj = total_nb_kj + entry.bond_force_kj + entry.angle_force_kj
 
         # 7. 转单位为 kBT/nm
         predictions.append(total_kj * factor)
@@ -581,6 +786,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--summary", type=Path, default=Path("topology_summary.json"), help="Parameter summary JSON")
     parser.add_argument("--bond-csv", type=Path, default=Path("center_bond_forces.csv"), help="CSV file with bond forces (kJ/mol/nm)")
     parser.add_argument("--angle-csv", type=Path, default=Path("center_angle_forces.csv"), help="CSV file with angle forces (kJ/mol/nm)")
+    parser.add_argument("--coulomb-csv", type=Path, default=Path("center_coulomb_forces.csv"), help="CSV cache for Coulomb forces (kJ/mol/nm)")
+    parser.add_argument("--dihedral-csv", type=Path, default=Path("center_dihedral_forces.csv"), help="CSV cache for dihedral forces (kJ/mol/nm)")
     parser.add_argument("--output-summary", type=Path, default=Path("topology_summary.optimised.json"), help="Where to write the updated summary JSON")
     parser.add_argument("--log", type=Path, default=Path("optimization_log.json"), help="Where to store optimisation metrics")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of dataset entries (for debugging)")
@@ -591,6 +798,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--epsilon-max", type=float, default=5.0)
     parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "gpu"),
+        default="gpu",
+        help="Device for LJ force evaluation (GPU requires torch with CUDA)",
+    )
     return parser.parse_args(argv)
 
 
@@ -608,9 +821,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bond_forces = load_force_map(args.bond_csv, "bond")
     angle_forces = load_force_map(args.angle_csv, "angle")
 
+
     entries = build_entries(raw_data, bond_forces, angle_forces, limit=args.limit)
     if not entries:
         raise ValueError("No valid entries found in dataset")
+
+    coulomb_cache = cache_force_component(
+        entries,
+        summary,
+        args.coulomb_csv,
+        "coulomb",
+        lambda top, coords: compute_nonbonded_forces(
+            top,
+            coords,
+            rcoul=args.rcoul,
+            rvdw=0.0,
+            do_lj=False,
+            do_coul=True,
+            device="gpu",
+        ),
+    )
+    dihedral_cache = cache_force_component(
+        entries,
+        summary,
+        args.dihedral_csv,
+        "dihedral",
+        lambda top, coords: compute_dihedral_forces(top, coords),
+    )
+    apply_cached_component(entries, coulomb_cache, "coulomb_force_kj")
+    apply_cached_component(entries, dihedral_cache, "dihedral_force_kj")
 
     lj_targets = select_optimisable_lj(summary, fix_hydroxyl_h=True)
     sigma0 = np.array([item.sigma for item in lj_targets], dtype=float)
@@ -621,7 +860,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     logger = OptimisationLogger([item.label for item in lj_targets])
 
-    initial_pred = predict_forces(summary, entries, rcoul=args.rcoul, rvdw=args.rvdw)
+    initial_pred = predict_forces(
+        summary,
+        entries,
+        rvdw=args.rvdw,
+        device=args.device,
+    )
     initial_metrics = compute_metrics(initial_pred, targets)
     logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0))
 
@@ -642,7 +886,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def objective(vec: Sequence[float]) -> float:
         sigma, epsilon = _unpack(vec)
         apply_lj_parameters(summary, lj_targets, sigma, epsilon)
-        pred = predict_forces(summary, entries, rcoul=args.rcoul, rvdw=args.rvdw)
+        pred = predict_forces(
+            summary,
+            entries,
+            rvdw=args.rvdw,
+            device=args.device,
+        )
         metrics = compute_metrics(pred, targets)
         logger.eval_counter += 1
         logger.log(
@@ -663,7 +912,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sigma_opt, epsilon_opt = _unpack(result.x)
     apply_lj_parameters(summary, lj_targets, sigma_opt, epsilon_opt)
-    final_pred = predict_forces(summary, entries, rcoul=args.rcoul, rvdw=args.rvdw)
+    final_pred = predict_forces(
+        summary,
+        entries,
+        rvdw=args.rvdw,
+        device=args.device,
+    )
     final_metrics = compute_metrics(final_pred, targets)
     logger.log("final", final_metrics, logger.snapshot_params(sigma_opt, epsilon_opt))
 
