@@ -8,7 +8,8 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from types import SimpleNamespace
 
 try:  # pragma: no cover - optional dependency guard
     import numpy as np
@@ -46,18 +47,18 @@ class CenterForceEntry:
     index: int
     gro_file: str
     atom_types: List[str]
-    coords: NDArray[np.float64]
-    charges: NDArray[np.float64]
+    coords: NDArray[np.float32]
+    charges: NDArray[np.float32]
     center_index: int
     temperature: float
-    target_force: NDArray[np.float64]
-    bond_force_kj: NDArray[np.float64]
-    angle_force_kj: NDArray[np.float64]
-    box: NDArray[np.float64]
-    coulomb_force_kj: NDArray[np.float64] = field(
+    target_force: NDArray[np.float32]
+    bond_force_kj: NDArray[np.float32]
+    angle_force_kj: NDArray[np.float32]
+    box: NDArray[np.float32]
+    coulomb_force_kj: NDArray[np.float32] = field(
         default_factory=lambda: np.zeros(3, dtype=float)
     )
-    dihedral_force_kj: NDArray[np.float64] = field(
+    dihedral_force_kj: NDArray[np.float32] = field(
         default_factory=lambda: np.zeros(3, dtype=float)
     )
 
@@ -70,13 +71,21 @@ class OptimisableLJEntry:
     epsilon: float
 
 
+@dataclass
+class PreparedEntry:
+    entry: CenterForceEntry
+    topology: Topology
+    temperature_factor: float
+    coords_gpu: Optional[Any] = None
+
+
 def load_json(path: Path) -> Mapping[str, object] | Sequence[object]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def load_force_map(csv_path: Path, label: str) -> Dict[Tuple[str, int], NDArray[np.float64]]:
-    fmap: Dict[Tuple[str, int], NDArray[np.float64]] = {}
+def load_force_map(csv_path: Path, label: str) -> Dict[Tuple[str, int], NDArray[np.float32]]:
+    fmap: Dict[Tuple[str, int], NDArray[np.float32]] = {}
     if not csv_path.is_file():
         print(f"[load_{label}] WARNING: {csv_path} not found; defaulting to zeros")
         return fmap
@@ -108,13 +117,13 @@ def cache_force_component(
     summary: MutableMapping[str, object],
     csv_path: Path,
     label: str,
-    compute_fn: Callable[[Topology, NDArray[np.float64]], NDArray[np.float64]],
-) -> Dict[Tuple[str, int], NDArray[np.float64]]:
+    compute_fn: Callable[[Topology, NDArray[np.float32]], NDArray[np.float32]],
+) -> Dict[Tuple[str, int], NDArray[np.float32]]:
     if csv_path.is_file():
         return load_force_map(csv_path, label)
 
     rows: List[Dict[str, object]] = []
-    cache: Dict[Tuple[str, int], NDArray[np.float64]] = {}
+    cache: Dict[Tuple[str, int], NDArray[np.float32]] = {}
     for entry in entries:
         top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
         for atom, charge in zip(top.atoms, entry.charges):
@@ -143,7 +152,7 @@ def cache_force_component(
 
 def apply_cached_component(
     entries: Sequence[CenterForceEntry],
-    cache: Mapping[Tuple[str, int], NDArray[np.float64]],
+    cache: Mapping[Tuple[str, int], NDArray[np.float32]],
     attr: str,
 ) -> None:
     for entry in entries:
@@ -164,7 +173,7 @@ def _infer_center_index(entry: Mapping[str, object]) -> Optional[int]:
     return None
 
 def _find_center_index_by_coords(
-    coords: NDArray[np.float64],
+    coords: NDArray[np.float32],
     atom: Mapping[str, object],
     entry_id: str = ""
 ) -> Optional[int]:
@@ -192,7 +201,7 @@ def _find_center_index_by_coords(
     return idx
 
 
-def _as_box(entry: Mapping[str, object]) -> NDArray[np.float64]:
+def _as_box(entry: Mapping[str, object]) -> NDArray[np.float32]:
     box = entry.get("box")
     if isinstance(box, Sequence) and len(box) == 3:
         arr = np.asarray(box, dtype=float).reshape(3,)
@@ -202,8 +211,8 @@ def _as_box(entry: Mapping[str, object]) -> NDArray[np.float64]:
 
 def build_entries(
     data: Sequence[Mapping[str, object]],
-    bond_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
-    angle_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
+    bond_forces: Mapping[Tuple[str, int], NDArray[np.float32]],
+    angle_forces: Mapping[Tuple[str, int], NDArray[np.float32]],
     limit: Optional[int] = None,
 ) -> List[CenterForceEntry]:
     entries: List[CenterForceEntry] = []
@@ -318,8 +327,8 @@ from collections import Counter
 
 def debug_filtering(
     data: Sequence[Mapping[str, object]],
-    bond_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
-    angle_forces: Mapping[Tuple[str, int], NDArray[np.float64]],
+    bond_forces: Mapping[Tuple[str, int], NDArray[np.float32]],
+    angle_forces: Mapping[Tuple[str, int], NDArray[np.float32]],
     limit: Optional[int] = None,
 ) -> None:
     stats = Counter()
@@ -398,6 +407,60 @@ def select_optimisable_lj(summary: MutableMapping[str, object], fix_hydroxyl_h: 
     if not entries:
         raise ValueError("No Lennard-Jones entries available for optimisation")
     return entries
+
+
+def _sync_topology_atomtypes(top: Topology, lj_list: Sequence[Mapping[str, object]]) -> None:
+    for atom_type in top.atomtypes.values():
+        idx = getattr(atom_type, "source_entry_idx", None)
+        if idx is None:
+            continue
+        if idx < 0 or idx >= len(lj_list):
+            continue
+        entry = lj_list[idx]
+        sigma = float(entry["sigma"])
+        epsilon = float(entry["epsilon"])
+        atom_type.sigma = sigma
+        atom_type.epsilon = epsilon
+        atom_type.C6 = float(entry.get("C6", 4.0 * epsilon * (sigma ** 6)))
+        atom_type.C12 = float(entry.get("C12", 4.0 * epsilon * (sigma ** 12)))
+
+
+def prepare_entries_for_prediction(
+    summary: MutableMapping[str, object],
+    entries: Sequence[CenterForceEntry],
+    device: str,
+) -> List[PreparedEntry]:
+    prepared: List[PreparedEntry] = []
+    use_gpu = device.lower() == "gpu" and torch is not None and torch.cuda.is_available()
+    gpu_device = torch.device("cuda") if use_gpu else None
+
+    for entry in entries:
+        top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
+        for atom, charge in zip(top.atoms, entry.charges):
+            atom.charge = float(charge)
+        factor = 1.0 / (R_KJ_PER_MOL_K * max(float(entry.temperature), 1e-6))
+        coords_gpu = None
+        if use_gpu:
+            coords_gpu = torch.as_tensor(entry.coords, dtype=torch.float32, device=gpu_device)
+        prepared.append(
+            PreparedEntry(
+                entry=entry,
+                topology=top,
+                temperature_factor=factor,
+                coords_gpu=coords_gpu,
+            )
+        )
+    return prepared
+
+
+def refresh_prepared_topologies(
+    prepared_entries: Sequence[PreparedEntry], summary: MutableMapping[str, object]
+) -> None:
+    lj_list = summary.get("lj", [])
+    if not isinstance(lj_list, Sequence):
+        return
+    for prepared in prepared_entries:
+        _sync_topology_atomtypes(prepared.topology, lj_list)
 
 
 def apply_lj_parameters(
@@ -523,76 +586,80 @@ def _compute_nonbonded_forces_gpu(
         raise RuntimeError("GPU acceleration requested but CUDA device is not available")
 
     device = torch.device("cuda")
-    dtype = torch.float64
-    coords = torch.as_tensor(np.asarray(coords_in, dtype=float), dtype=dtype, device=device)
-    n = coords.shape[0]
-    forces = torch.zeros_like(coords)
+    dtype = torch.float32
+    with torch.no_grad():
+        if isinstance(coords_in, torch.Tensor):
+            coords = coords_in.to(device=device, dtype=dtype)
+        else:
+            coords = torch.as_tensor(np.asarray(coords_in, dtype=float), dtype=dtype, device=device)
+        n = coords.shape[0]
+        forces = torch.zeros_like(coords)
 
-    charges = torch.tensor([a.charge for a in top.atoms], dtype=dtype, device=device)
-    sigma = torch.tensor([top.atomtypes[a.type_name].sigma for a in top.atoms], dtype=dtype, device=device)
-    epsilon = torch.tensor([top.atomtypes[a.type_name].epsilon for a in top.atoms], dtype=dtype, device=device)
+        charges = torch.tensor([a.charge for a in top.atoms], dtype=dtype, device=device)
+        sigma = torch.tensor([top.atomtypes[a.type_name].sigma for a in top.atoms], dtype=dtype, device=device)
+        epsilon = torch.tensor([top.atomtypes[a.type_name].epsilon for a in top.atoms], dtype=dtype, device=device)
 
-    exclusion_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
-    for i, j in build_exclusions(top):
-        i0, j0 = i - 1, j - 1
-        exclusion_mask[i0, j0] = True
-        exclusion_mask[j0, i0] = True
+        exclusion_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+        for i, j in build_exclusions(top):
+            i0, j0 = i - 1, j - 1
+            exclusion_mask[i0, j0] = True
+            exclusion_mask[j0, i0] = True
 
-    pair14_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
-    for i, j in top.pairs14:
-        i0, j0 = i - 1, j - 1
-        pair14_mask[i0, j0] = True
-        pair14_mask[j0, i0] = True
+        pair14_mask = torch.zeros((n, n), dtype=torch.bool, device=device)
+        for i, j in top.pairs14:
+            i0, j0 = i - 1, j - 1
+            pair14_mask[i0, j0] = True
+            pair14_mask[j0, i0] = True
 
-    diff = coords[:, None, :] - coords[None, :, :]
-    r2 = torch.sum(diff * diff, dim=-1)
-    triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
-    valid_mask = triu_mask & (r2 >= 1e-24)
+        diff = coords[:, None, :] - coords[None, :, :]
+        r2 = torch.sum(diff * diff, dim=-1)
+        triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
+        valid_mask = triu_mask & (r2 >= 1e-24)
 
-    if do_lj and rvdw > 0:
-        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
-        mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
-        if torch.any(mask):
-            sig = torch.sqrt(sigma[:, None] * sigma[None, :])
-            eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
-            c6 = 4.0 * eps * (sig ** 6)
-            c12 = 4.0 * eps * (sig ** 12)
-            c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
-            c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
+        if do_lj and rvdw > 0:
+            dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+            mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
+            if torch.any(mask):
+                sig = torch.sqrt(sigma[:, None] * sigma[None, :])
+                eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
+                c6 = 4.0 * eps * (sig ** 6)
+                c12 = 4.0 * eps * (sig ** 12)
+                c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
+                c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
 
-            c6_vals = c6[mask]
-            c12_vals = c12[mask]
-            r2_vals = r2[mask]
-            dvec = diff[mask]
+                c6_vals = c6[mask]
+                c12_vals = c12[mask]
+                r2_vals = r2[mask]
+                dvec = diff[mask]
 
-            invr2 = 1.0 / r2_vals
-            invr6 = invr2 ** 3
-            invr12 = invr6 ** 2
-            coef = (12.0 * c12_vals * invr12 - 6.0 * c6_vals * invr6) * invr2
-            pair_forces = -coef[:, None] * dvec
+                invr2 = 1.0 / r2_vals
+                invr6 = invr2 ** 3
+                invr12 = invr6 ** 2
+                coef = (12.0 * c12_vals * invr12 - 6.0 * c6_vals * invr6) * invr2
+                pair_forces = -coef[:, None] * dvec
 
-            pairs = torch.nonzero(mask, as_tuple=False)
-            forces.index_add_(0, pairs[:, 0], pair_forces)
-            forces.index_add_(0, pairs[:, 1], -pair_forces)
+                pairs = torch.nonzero(mask, as_tuple=False)
+                forces.index_add_(0, pairs[:, 0], pair_forces)
+                forces.index_add_(0, pairs[:, 1], -pair_forces)
 
-    if do_coul and rcoul > 0:
-        dist = torch.sqrt(torch.clamp(r2, min=1e-24))
-        mask = valid_mask & (~exclusion_mask) & (dist < rcoul)
-        if torch.any(mask):
-            qq = charges[:, None] * charges[None, :]
-            qq = torch.where(pair14_mask, qq * top.fudgeQQ, qq)
-            qq_vals = qq[mask]
-            r_vals = dist[mask]
-            invr = 1.0 / r_vals
-            coef = KELEC * qq_vals * (invr ** 3)
-            dvec = diff[mask]
-            pair_forces = -coef[:, None] * dvec
+        if do_coul and rcoul > 0:
+            dist = torch.sqrt(torch.clamp(r2, min=1e-24))
+            mask = valid_mask & (~exclusion_mask) & (dist < rcoul)
+            if torch.any(mask):
+                qq = charges[:, None] * charges[None, :]
+                qq = torch.where(pair14_mask, qq * top.fudgeQQ, qq)
+                qq_vals = qq[mask]
+                r_vals = dist[mask]
+                invr = 1.0 / r_vals
+                coef = KELEC * qq_vals * (invr ** 3)
+                dvec = diff[mask]
+                pair_forces = -coef[:, None] * dvec
 
-            pairs = torch.nonzero(mask, as_tuple=False)
-            forces.index_add_(0, pairs[:, 0], pair_forces)
-            forces.index_add_(0, pairs[:, 1], -pair_forces)
+                pairs = torch.nonzero(mask, as_tuple=False)
+                forces.index_add_(0, pairs[:, 0], pair_forces)
+                forces.index_add_(0, pairs[:, 1], -pair_forces)
 
-    return forces.detach().cpu().numpy()
+        return forces.detach().cpu().numpy()
 
 
 def compute_dihedral_forces(
@@ -670,10 +737,10 @@ def compute_dihedral_forces(
 
 def predict_forces(
     summary: MutableMapping[str, object],
-    entries: Sequence[CenterForceEntry],
+    prepared_entries: Sequence[PreparedEntry],
     rvdw: float,
-    device: str = "cpu",
-) -> NDArray[np.float64]:
+    device: str = "gpu",
+) -> NDArray[np.float32]:
     """
     用和 compare_plot_csv.py 一致的方式计算预测力。
 
@@ -683,30 +750,28 @@ def predict_forces(
     - 再加 bond / angle（来自 CSV，单位 kJ/mol/nm）
     - 最后结果转成 kBT/nm
     """
-    predictions: List[NDArray[np.float64]] = []
+    predictions: List[NDArray[np.float32]] = []
 
-    for entry in entries:
-        # 1. 用 summary + 当前坐标/原子名 推拓扑
-        top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
+    use_gpu = device.lower() == "gpu"
 
-        # 2. 覆盖电荷，使之与 JSON 中 formal_charges 一致
-        for atom, charge in zip(top.atoms, entry.charges):
-            atom.charge = float(charge)
+    for prepared in prepared_entries:
+        entry = prepared.entry
+        coords_in: Any
+        if use_gpu and prepared.coords_gpu is not None:
+            coords_in = prepared.coords_gpu
+        else:
+            coords_in = entry.coords
 
-        T = float(entry.temperature)
-        factor = 1.0 / (R_KJ_PER_MOL_K * max(T, 1e-6))  # = 1/kBT
-
-        # 3. LJ 力：只算 LJ，不算库伦
         forces_lj_kj = compute_nonbonded_forces(
-            top,
-            entry.coords,
-            rcoul=0.0,      # 不算库仑
-            rvdw=rvdw,      # LJ 截断由参数控制
+            prepared.topology,
+            coords_in,
+            rcoul=0.0,
+            rvdw=rvdw,
             do_lj=True,
             do_coul=False,
+            device=device,
         )
 
-        # 4. 在中心原子上把各项加起来（库伦 / 二面角来自缓存）
         idx = entry.center_index
         total_nb_kj = (
             forces_lj_kj[idx]
@@ -715,12 +780,11 @@ def predict_forces(
         )
         total_kj = total_nb_kj + entry.bond_force_kj + entry.angle_force_kj
 
-        # 7. 转单位为 kBT/nm
-        predictions.append(total_kj * factor)
+        predictions.append(total_kj * prepared.temperature_factor)
 
     return np.vstack(predictions)
 
-def compute_metrics(pred: NDArray[np.float64], target: NDArray[np.float64]) -> Dict[str, Dict[str, float]]:
+def compute_metrics(pred: NDArray[np.float32], target: NDArray[np.float32]) -> Dict[str, Dict[str, float]]:
     diff = pred - target
     mse_axes = np.mean(diff ** 2, axis=0)
     mse_total = float(np.mean(diff ** 2))
@@ -751,11 +815,34 @@ def compute_metrics(pred: NDArray[np.float64], target: NDArray[np.float64]) -> D
     return {"loss": loss, "r2": r2_axes}
 
 
+class EarlyStopException(RuntimeError):
+    """Raised internally to abort optimisation once patience is exceeded."""
+
+
+class EarlyStopping:
+    def __init__(self, patience: int, min_delta: float = 1e-9, initial_loss: float = math.inf):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = initial_loss
+        self.steps_since_best = 0
+
+    def update(self, loss_value: float) -> bool:
+        if loss_value + self.min_delta < self.best_loss:
+            self.best_loss = loss_value
+            self.steps_since_best = 0
+            return False
+        self.steps_since_best += 1
+        return self.steps_since_best >= self.patience
+
+
 class OptimisationLogger:
     def __init__(self, labels: Sequence[str]):
         self.labels = list(labels)
         self.records: List[Dict[str, object]] = []
         self.eval_counter = 0
+        self.best_loss = math.inf
+        self.best_params_snapshot: Dict[str, Dict[str, float]] = {}
+        self.best_iteration_label: Optional[str] = None
 
     def snapshot_params(
         self, sigma: Sequence[float], epsilon: Sequence[float]
@@ -778,6 +865,41 @@ class OptimisationLogger:
         if iteration is not None:
             msg = f"{msg} (iter={iteration})"
         print(msg)
+        self._update_best(metrics["loss"]["total"], params, iteration, stage)
+        self._print_best()
+
+    def _update_best(
+        self,
+        loss_value: float,
+        params: Dict[str, Dict[str, float]],
+        iteration: Optional[int],
+        stage: str,
+    ) -> None:
+        if loss_value >= self.best_loss - 1e-12:
+            return
+        self.best_loss = loss_value
+        self.best_params_snapshot = params
+        if iteration is None:
+            self.best_iteration_label = stage
+        else:
+            self.best_iteration_label = str(iteration)
+
+    def _print_best(self) -> None:
+        if not self.best_params_snapshot:
+            return
+        parts = []
+        for label in self.labels:
+            params = self.best_params_snapshot.get(label)
+            if not params:
+                continue
+            parts.append(
+                f"{label}(sigma={params['sigma']:.4f}, epsilon={params['epsilon']:.4f})"
+            )
+        iter_label = self.best_iteration_label or "n/a"
+        print(
+            f"[best_so_far] loss_total={self.best_loss:.6f} @iter={iter_label}: "
+            + ", ".join(parts)
+        )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -858,11 +980,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_lj_parameters(summary, lj_targets, sigma0, epsilon0)
     targets = np.vstack([entry.target_force for entry in entries])
 
+    prepared_entries = prepare_entries_for_prediction(summary, entries, device=args.device)
+    refresh_prepared_topologies(prepared_entries, summary)
+
     logger = OptimisationLogger([item.label for item in lj_targets])
 
     initial_pred = predict_forces(
         summary,
-        entries,
+        prepared_entries,
         rvdw=args.rvdw,
         device=args.device,
     )
@@ -875,46 +1000,78 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _ in lj_targets:
         bounds.append((args.epsilon_min, args.epsilon_max))
 
-    def _pack(s: NDArray[np.float64], e: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _pack(s: NDArray[np.float32], e: NDArray[np.float32]) -> NDArray[np.float32]:
         return np.concatenate([s, e])
 
-    def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
         vec = np.asarray(vec, dtype=float)
         n = len(lj_targets)
         return vec[:n], vec[n:]
 
+    best_state = {
+        "loss": float(initial_metrics["loss"]["total"]),
+        "vec": _pack(sigma0, epsilon0),
+    }
+    patience = 500
+    early_stopper = EarlyStopping(
+        patience=patience, initial_loss=best_state["loss"], min_delta=1e-9
+    )
+
     def objective(vec: Sequence[float]) -> float:
         sigma, epsilon = _unpack(vec)
         apply_lj_parameters(summary, lj_targets, sigma, epsilon)
+        refresh_prepared_topologies(prepared_entries, summary)
         pred = predict_forces(
             summary,
-            entries,
+            prepared_entries,
             rvdw=args.rvdw,
             device=args.device,
         )
         metrics = compute_metrics(pred, targets)
         logger.eval_counter += 1
-        logger.log(
-            "iteration",
-            metrics,
-            logger.snapshot_params(sigma, epsilon),
-            iteration=logger.eval_counter,
+    # 每 5 次打印一次
+        if logger.eval_counter % 5 == 0:
+            logger.log(
+                "iteration",
+                metrics,
+                logger.snapshot_params(sigma, epsilon),
+                iteration=logger.eval_counter,
+            )
+
+        loss_value = metrics["loss"]["total"]
+        if loss_value < best_state["loss"] - 1e-12:
+            best_state["loss"] = loss_value
+            best_state["vec"] = _pack(sigma, epsilon)
+        if early_stopper.update(loss_value):
+            raise EarlyStopException(
+                f"No improvement for {patience} evaluations; stopping early."
+            )
+        return loss_value
+
+    try:
+        result = minimize(
+            objective,
+            _pack(sigma0, epsilon0),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": args.max_iter, "disp": True},
         )
-        return metrics["loss"]["total"]
+    except EarlyStopException as exc:
+        print(f"[EARLY STOP] {exc}")
+        result = SimpleNamespace(
+            x=best_state["vec"],
+            success=False,
+            message=str(exc),
+            nfev=int(logger.eval_counter),
+            nit=int(logger.eval_counter),
+        )
 
-    result = minimize(
-        objective,
-        _pack(sigma0, epsilon0),
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={"maxiter": args.max_iter, "disp": True},
-    )
-
-    sigma_opt, epsilon_opt = _unpack(result.x)
+    sigma_opt, epsilon_opt = _unpack(best_state["vec"])
     apply_lj_parameters(summary, lj_targets, sigma_opt, epsilon_opt)
+    refresh_prepared_topologies(prepared_entries, summary)
     final_pred = predict_forces(
         summary,
-        entries,
+        prepared_entries,
         rvdw=args.rvdw,
         device=args.device,
     )
