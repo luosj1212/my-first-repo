@@ -87,6 +87,27 @@ class PreparedEntry:
     temperature_factor_gpu: Optional[Any] = None
 
 
+@dataclass
+class PairMetadata:
+    """Metadata describing how each pair type maps to LJ summary indices."""
+
+    idx_i: np.ndarray
+    idx_j: np.ndarray
+    active_mask: np.ndarray
+
+
+@dataclass
+class LinearizedLJSystem:
+    """Linearized representation of LJ contributions for all entries."""
+
+    A_alpha: np.ndarray
+    A_beta: np.ndarray
+    F_fixed_kJ: np.ndarray
+    F_target_kBT: np.ndarray
+    temperature_factors: np.ndarray
+    pair_metadata: PairMetadata
+
+
 def load_json(path: Path) -> Mapping[str, object] | Sequence[object]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
@@ -511,6 +532,162 @@ def refresh_prepared_topologies(
         _sync_topology_atomtypes(prepared.topology, lj_list)
 
 
+def _atomtype_summary_index(top: Topology, atom_idx: int) -> Optional[int]:
+    atom = top.atoms[atom_idx]
+    atom_type = top.atomtypes.get(atom.type_name)
+    if atom_type is None:
+        return None
+    idx = getattr(atom_type, "source_entry_idx", None)
+    if idx is None:
+        return None
+    return int(idx)
+
+
+def _collect_center_lj_pairs(
+    top: Topology, coords: NDArray[np.float32], center_idx: int, rvdw: float
+) -> List[Tuple[int, np.ndarray, np.ndarray]]:
+    coords_arr = np.asarray(coords, dtype=float)
+    if coords_arr.ndim != 2 or coords_arr.shape[1] != 3:
+        raise ValueError("Coordinates must be of shape (N,3) for LJ aggregation")
+    if rvdw <= 0.0:
+        return []
+    exclusion_pairs = set()
+    for i, j in build_exclusions(top):
+        pair = (min(i - 1, j - 1), max(i - 1, j - 1))
+        exclusion_pairs.add(pair)
+    pair14_pairs = {
+        (min(i - 1, j - 1), max(i - 1, j - 1)) for (i, j) in getattr(top, "pairs14", set())
+    }
+    center_coord = coords_arr[center_idx]
+    contributions: List[Tuple[int, np.ndarray, np.ndarray]] = []
+    n_atoms = coords_arr.shape[0]
+    for nb_idx in range(n_atoms):
+        if nb_idx == center_idx:
+            continue
+        pair_key = (min(center_idx, nb_idx), max(center_idx, nb_idx))
+        if pair_key in exclusion_pairs:
+            continue
+        disp = coords_arr[nb_idx] - center_coord
+        r2 = float(np.dot(disp, disp))
+        if r2 < 1e-24:
+            continue
+        dist = math.sqrt(r2)
+        if dist >= rvdw:
+            continue
+        inv_r = 1.0 / dist
+        r_hat = disp * inv_r
+        invr2 = inv_r * inv_r
+        invr6 = invr2 ** 3
+        invr12 = invr6 ** 2
+        scale = float(top.fudgeLJ) if pair_key in pair14_pairs else 1.0
+        coeff_alpha = (-12.0 * invr12 * inv_r * scale) * r_hat
+        coeff_beta = (6.0 * invr6 * inv_r * scale) * r_hat
+        contributions.append((nb_idx, coeff_alpha, coeff_beta))
+    return contributions
+
+
+def build_linearized_lj_system(
+    prepared_entries: Sequence[PreparedEntry],
+    summary: MutableMapping[str, object],
+    rvdw: float,
+) -> Tuple[LinearizedLJSystem, np.ndarray, np.ndarray]:
+    lj_list = summary.get("lj", [])
+    if not isinstance(lj_list, Sequence):
+        raise ValueError("summary JSON missing 'lj' list for LJ aggregation")
+    n_entries = len(prepared_entries)
+    sigma_all = np.array([float(item.get("sigma", 0.0)) for item in lj_list], dtype=float)
+    epsilon_all = np.array([float(item.get("epsilon", 0.0)) for item in lj_list], dtype=float)
+    pair_index: Dict[Tuple[int, int], int] = {}
+    pair_order: List[Tuple[int, int]] = []
+    per_entry_pairs: List[List[Tuple[int, np.ndarray, np.ndarray]]] = []
+    F_fixed_kJ = np.zeros((n_entries, 3), dtype=np.float64)
+    F_target_kBT = np.zeros((n_entries, 3), dtype=np.float64)
+    temperature_factors = np.zeros(n_entries, dtype=np.float64)
+
+    for entry_idx, prepared in enumerate(prepared_entries):
+        entry = prepared.entry
+        top = prepared.topology
+        center_idx = int(entry.center_index)
+        center_type_idx = _atomtype_summary_index(top, center_idx)
+        if center_type_idx is None:
+            raise ValueError(
+                f"Atom type for center index {center_idx} missing LJ source index in entry {entry.gro_file}"
+            )
+        contributions: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        for nb_idx, coeff_alpha, coeff_beta in _collect_center_lj_pairs(
+            top, entry.coords, center_idx, rvdw
+        ):
+            nb_type_idx = _atomtype_summary_index(top, nb_idx)
+            if nb_type_idx is None:
+                continue
+            if center_type_idx <= nb_type_idx:
+                pair_key = (center_type_idx, nb_type_idx)
+            else:
+                pair_key = (nb_type_idx, center_type_idx)
+            if pair_key not in pair_index:
+                pair_index[pair_key] = len(pair_order)
+                pair_order.append(pair_key)
+            p_idx = pair_index[pair_key]
+            contributions.append((p_idx, coeff_alpha.astype(float), coeff_beta.astype(float)))
+        per_entry_pairs.append(contributions)
+        F_fixed_kJ[entry_idx] = (
+            np.asarray(entry.bond_force_kj, dtype=float)
+            + np.asarray(entry.angle_force_kj, dtype=float)
+            + np.asarray(entry.dihedral_force_kj, dtype=float)
+            + np.asarray(entry.coulomb_force_kj, dtype=float)
+        )
+        F_target_kBT[entry_idx] = np.asarray(entry.target_force, dtype=float)
+        temperature_factors[entry_idx] = float(prepared.temperature_factor)
+
+    n_pairs = len(pair_order)
+    A_alpha = np.zeros((n_entries, n_pairs, 3), dtype=np.float64)
+    A_beta = np.zeros((n_entries, n_pairs, 3), dtype=np.float64)
+    for entry_idx, contribs in enumerate(per_entry_pairs):
+        for p_idx, coeff_alpha, coeff_beta in contribs:
+            A_alpha[entry_idx, p_idx, :] += coeff_alpha
+            A_beta[entry_idx, p_idx, :] += coeff_beta
+
+    idx_i = np.array([pair[0] for pair in pair_order], dtype=np.int64) if pair_order else np.zeros(0, dtype=np.int64)
+    idx_j = np.array([pair[1] for pair in pair_order], dtype=np.int64) if pair_order else np.zeros(0, dtype=np.int64)
+    active_mask = np.ones(len(pair_order), dtype=bool)
+    metadata = PairMetadata(idx_i=idx_i, idx_j=idx_j, active_mask=active_mask)
+    system = LinearizedLJSystem(
+        A_alpha=A_alpha,
+        A_beta=A_beta,
+        F_fixed_kJ=F_fixed_kJ,
+        F_target_kBT=F_target_kBT,
+        temperature_factors=temperature_factors,
+        pair_metadata=metadata,
+    )
+    return system, sigma_all, epsilon_all
+
+
+def _compute_pair_alpha_beta_torch(
+    sigma_full: "torch.Tensor",
+    epsilon_full: "torch.Tensor",
+    idx_i_t: "torch.Tensor",
+    idx_j_t: "torch.Tensor",
+    active_mask_t: "torch.Tensor",
+) -> Tuple["torch.Tensor", "torch.Tensor"]:
+    if torch is None:
+        raise RuntimeError("Torch is required for linearised LJ evaluation")
+    if idx_i_t.numel() == 0:
+        zero = torch.zeros(0, dtype=sigma_full.dtype, device=sigma_full.device)
+        return zero, zero
+    sigma_i = sigma_full[idx_i_t]
+    sigma_j = sigma_full[idx_j_t]
+    epsilon_i = epsilon_full[idx_i_t]
+    epsilon_j = epsilon_full[idx_j_t]
+    valid = active_mask_t
+    valid = valid & (sigma_i > 0.0) & (sigma_j > 0.0) & (epsilon_i > 0.0) & (epsilon_j > 0.0)
+    sig_mix = torch.sqrt(torch.clamp(sigma_i * sigma_j, min=1e-24))
+    eps_mix = torch.sqrt(torch.clamp(epsilon_i * epsilon_j, min=1e-24))
+    sigma6 = sig_mix.pow(6)
+    beta = torch.where(valid, 4.0 * eps_mix * sigma6, torch.zeros_like(sig_mix))
+    alpha = beta * sigma6
+    return alpha, beta
+
+
 def apply_lj_parameters(
     summary: MutableMapping[str, object],
     targets: Sequence[OptimisableLJEntry],
@@ -683,7 +860,9 @@ def _compute_nonbonded_forces_gpu(
         pair14_mask[i0, j0] = True
         pair14_mask[j0, i0] = True
 
-    diff = coords[:, None, :] - coords[None, :, :]
+    diff = coords[None, :, :] - coords[:, None, :]
+# 现在 diff[i, j] = coords[j] - coords[i]，和 CPU / compare_forces 一致
+
     r2 = torch.sum(diff * diff, dim=-1)
     triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
     valid_mask = triu_mask & (r2 >= 1e-24)
@@ -810,73 +989,6 @@ def compute_dihedral_forces(
     return forces
 
 
-def _assemble_atomwise_lj_parameters(
-    prepared: PreparedEntry,
-    sigma_params: "torch.Tensor",
-    epsilon_params: "torch.Tensor",
-) -> Tuple["torch.Tensor", "torch.Tensor"]:
-    if torch is None:
-        raise RuntimeError("Torch is required for GPU LJ assembly")
-    if (
-        prepared.atom_param_index is None
-        or prepared.sigma_constant_gpu is None
-        or prepared.epsilon_constant_gpu is None
-    ):
-        raise RuntimeError("Prepared entry missing GPU parameter metadata")
-    sigma_atoms = prepared.sigma_constant_gpu.clone()
-    epsilon_atoms = prepared.epsilon_constant_gpu.clone()
-    mask = prepared.atom_param_index >= 0
-    if torch.any(mask):
-        gather_idx = prepared.atom_param_index[mask]
-        sigma_atoms[mask] = sigma_params[gather_idx]
-        epsilon_atoms[mask] = epsilon_params[gather_idx]
-    return sigma_atoms, epsilon_atoms
-
-
-def predict_forces_gpu_params(
-    prepared_entries: Sequence[PreparedEntry],
-    sigma_params: "torch.Tensor",
-    epsilon_params: "torch.Tensor",
-    rvdw: float,
-) -> "torch.Tensor":
-    if torch is None:
-        raise RuntimeError("Torch is required for GPU prediction")
-    predictions: List["torch.Tensor"] = []
-    for prepared in prepared_entries:
-        if prepared.coords_gpu is None:
-            raise RuntimeError("Prepared entry missing GPU coordinates")
-        sigma_atoms, epsilon_atoms = _assemble_atomwise_lj_parameters(
-            prepared, sigma_params, epsilon_params
-        )
-        forces_lj = _compute_nonbonded_forces_gpu(
-            prepared.topology,
-            prepared.coords_gpu,
-            rcoul=0.0,
-            rvdw=rvdw,
-            do_lj=True,
-            do_coul=False,
-            sigma_override=sigma_atoms,
-            epsilon_override=epsilon_atoms,
-            return_numpy=False,
-        )
-        idx = prepared.entry.center_index
-        if (
-            prepared.coulomb_force_gpu is None
-            or prepared.dihedral_force_gpu is None
-            or prepared.bond_force_gpu is None
-            or prepared.angle_force_gpu is None
-            or prepared.temperature_factor_gpu is None
-        ):
-            raise RuntimeError("Prepared entry missing GPU cached forces")
-        total_nb = (
-            forces_lj[idx]
-            + prepared.coulomb_force_gpu
-            + prepared.dihedral_force_gpu
-        )
-        total_kj = total_nb + prepared.bond_force_gpu + prepared.angle_force_gpu
-        predictions.append(total_kj * prepared.temperature_factor_gpu)
-    return torch.stack(predictions)
-
 def predict_forces(
     summary: MutableMapping[str, object],
     prepared_entries: Sequence[PreparedEntry],
@@ -927,22 +1039,39 @@ def predict_forces(
     return np.vstack(predictions)
 
 
-def run_gpu_optimizer(
-    prepared_entries: Sequence[PreparedEntry],
-    targets_np: NDArray[np.float32],
+def run_linearized_torch_optimizer(
+    system: LinearizedLJSystem,
+    sigma_all0: np.ndarray,
+    epsilon_all0: np.ndarray,
+    trainable_summary_indices: Sequence[int],
     sigma0: NDArray[np.float32],
     epsilon0: NDArray[np.float32],
     args: argparse.Namespace,
     logger: OptimisationLogger,
 ) -> Tuple[NDArray[np.float32], NDArray[np.float32], Dict[str, object]]:
     if torch is None:
-        raise RuntimeError("Torch is required for GPU optimisation")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device is not available for GPU optimisation")
-    device = torch.device("cuda")
-    targets = torch.as_tensor(targets_np, dtype=torch.float32, device=device)
-    sigma_param = torch.nn.Parameter(torch.tensor(sigma0, dtype=torch.float32, device=device))
-    epsilon_param = torch.nn.Parameter(torch.tensor(epsilon0, dtype=torch.float32, device=device))
+        raise RuntimeError("Torch is required for linearised GPU optimisation")
+    want_gpu = args.device.lower() == "gpu"
+    if want_gpu and not torch.cuda.is_available():
+        print("[GPU] CUDA not available; falling back to CPU tensors for optimisation.")
+    device = torch.device("cuda" if want_gpu and torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    tensor_kwargs = {"dtype": dtype, "device": device}
+    A_alpha_t = torch.as_tensor(system.A_alpha, **tensor_kwargs)
+    A_beta_t = torch.as_tensor(system.A_beta, **tensor_kwargs)
+    F_fixed_t = torch.as_tensor(system.F_fixed_kJ, **tensor_kwargs)
+    F_target_t = torch.as_tensor(system.F_target_kBT, **tensor_kwargs)
+    temp_factors_t = torch.as_tensor(system.temperature_factors, **tensor_kwargs)
+    idx_i_t = torch.as_tensor(system.pair_metadata.idx_i, dtype=torch.long, device=device)
+    idx_j_t = torch.as_tensor(system.pair_metadata.idx_j, dtype=torch.long, device=device)
+    active_mask_t = torch.as_tensor(system.pair_metadata.active_mask, dtype=torch.bool, device=device)
+    sigma_base_t = torch.as_tensor(sigma_all0, **tensor_kwargs)
+    epsilon_base_t = torch.as_tensor(epsilon_all0, **tensor_kwargs)
+    trainable_idx_t = torch.as_tensor(trainable_summary_indices, dtype=torch.long, device=device)
+
+    sigma_param = torch.nn.Parameter(torch.as_tensor(sigma0, **tensor_kwargs))
+    epsilon_param = torch.nn.Parameter(torch.as_tensor(epsilon0, **tensor_kwargs))
     optimizer = torch.optim.Adam([sigma_param, epsilon_param], lr=float(args.learning_rate))
     early_stopper = EarlyStopping(
         patience=int(args.patience), initial_loss=float("inf"), min_delta=1e-9
@@ -950,6 +1079,13 @@ def run_gpu_optimizer(
     best_sigma = sigma0.copy()
     best_epsilon = epsilon0.copy()
     best_loss = float("inf")
+    target_np = system.F_target_kBT.astype(np.float32)
+
+    def assemble_full(base: "torch.Tensor", updates: "torch.Tensor") -> "torch.Tensor":
+        if trainable_idx_t.numel() == 0:
+            return base
+        full = base.clone()
+        return full.index_copy(0, trainable_idx_t, updates)
 
     for iteration in range(1, int(args.max_iter) + 1):
         optimizer.zero_grad()
@@ -959,37 +1095,59 @@ def run_gpu_optimizer(
         epsilon_clamped = torch.clamp(
             epsilon_param, min=float(args.epsilon_min), max=float(args.epsilon_max)
         )
-
-        preds = predict_forces_gpu_params(
-            prepared_entries, sigma_clamped, epsilon_clamped, args.rvdw
+        sigma_full = assemble_full(sigma_base_t, sigma_clamped)
+        epsilon_full = assemble_full(epsilon_base_t, epsilon_clamped)
+        alpha_t, beta_t = _compute_pair_alpha_beta_torch(
+            sigma_full, epsilon_full, idx_i_t, idx_j_t, active_mask_t
         )
+        if alpha_t.numel() == 0:
+            F_lj_t = torch.zeros_like(F_fixed_t)
+        else:
+            F_alpha = torch.einsum("epc,p->ec", A_alpha_t, alpha_t)
+            F_beta = torch.einsum("epc,p->ec", A_beta_t, beta_t)
+            F_lj_t = F_alpha + F_beta
+        F_pred_kJ = F_fixed_t + F_lj_t
+        F_pred_kBT = F_pred_kJ * temp_factors_t.unsqueeze(1)
+        loss_tensor = torch.mean((F_pred_kBT - F_target_t) ** 2)
 
-        # ---- NaN / Inf 检查：预测值 ----
-        if not torch.isfinite(preds).all():
-            print(f"[ERROR] NaN/Inf 出现在 preds (iter={iteration})")
-            print("sigma_clamped =", sigma_clamped.detach().cpu().numpy())
-            print("epsilon_clamped =", epsilon_clamped.detach().cpu().numpy())
-            break
-
-        loss_tensor = torch.mean((preds - targets) ** 2)
-
-        # ---- NaN / Inf 检查：loss ----
         if not torch.isfinite(loss_tensor):
-            print(f"[ERROR] NaN/Inf 出现在 loss (iter={iteration})")
-            print("sigma_clamped =", sigma_clamped.detach().cpu().numpy())
-            print("epsilon_clamped =", epsilon_clamped.detach().cpu().numpy())
+            print(f"[ERROR] Non-finite loss encountered at iteration {iteration}")
             break
 
         loss_tensor.backward()
 
-        # ---- NaN / Inf 检查：梯度 ----
-        for name, p in [("sigma", sigma_param), ("epsilon", epsilon_param)]:
-            if p.grad is not None and not torch.isfinite(p.grad).all():
-                print(f"[ERROR] NaN/Inf 出现在 {name}.grad (iter={iteration})")
-                print(f"{name}_clamped =", p.detach().cpu().numpy())
+        for name, param in (("sigma", sigma_param), ("epsilon", epsilon_param)):
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                print(f"[ERROR] Non-finite gradient for {name} at iteration {iteration}")
                 break
 
         optimizer.step()
+
+
+        # === 新增：模拟退火噪声 ===
+        if args.anneal_init > 0.0:
+            # 归一化进度 [0,1]
+            t = iteration / float(args.max_iter)
+            # 退火曲线：T(t) = T0 * (1 - t^p) + T1 * t^p
+            p = float(args.anneal_power)
+            tp = t**p
+            noise_scale = (1.0 - tp) * float(args.anneal_init) + tp * float(args.anneal_final)
+
+            if noise_scale > 0.0:
+                # 噪声尺度按参数取值区间来，避免量纲不一致
+                sigma_range = float(args.sigma_max) - float(args.sigma_min)
+                epsilon_range = float(args.epsilon_max) - float(args.epsilon_min)
+
+                with torch.no_grad():
+                    sigma_param.add_(
+                        torch.randn_like(sigma_param) * noise_scale * sigma_range
+                    )
+                    epsilon_param.add_(
+                        torch.randn_like(epsilon_param) * noise_scale * epsilon_range
+                    )
+                    # 退火之后再 clamp 一次，防止跳出边界
+                    sigma_param.clamp_(float(args.sigma_min), float(args.sigma_max))
+                    epsilon_param.clamp_(float(args.epsilon_min), float(args.epsilon_max))
 
         loss_value = float(loss_tensor.item())
         logger.eval_counter += 1
@@ -999,9 +1157,9 @@ def run_gpu_optimizer(
             best_sigma = sigma_clamped.detach().cpu().numpy()
             best_epsilon = epsilon_clamped.detach().cpu().numpy()
 
-        if logger.eval_counter % max(int(args.log_interval), 1) == 0:
-            pred_np = preds.detach().cpu().numpy()
-            metrics = compute_metrics(pred_np, targets_np)
+        if iteration % max(int(args.log_interval), 1) == 0:
+            pred_np = F_pred_kBT.detach().cpu().numpy().astype(np.float32)
+            metrics = compute_metrics(pred_np, target_np)
             logger.log(
                 "iteration",
                 metrics,
@@ -1009,25 +1167,27 @@ def run_gpu_optimizer(
                     sigma_clamped.detach().cpu().numpy(),
                     epsilon_clamped.detach().cpu().numpy(),
                 ),
-                iteration=logger.eval_counter,
+                iteration=iteration,
             )
 
         if early_stopper.best_loss is math.inf:
             early_stopper.best_loss = loss_value
         if early_stopper.update(loss_value):
             print(
-                f"[EARLY STOP GPU] No improvement for {args.patience} steps; stopping optimisation."
+                f"[EARLY STOP GPU] No improvement for {args.patience} iterations; stopping optimisation."
             )
             break
 
     meta = {
-        "method": "TorchAdam",
+        "method": "TorchAdamLinearized",
         "success": True,
-        "message": "GPU optimisation completed",
+        "message": "Torch optimisation completed",
         "nfev": int(logger.eval_counter),
         "nit": int(logger.eval_counter),
+        "device": device.type,
     }
     return best_sigma, best_epsilon, meta
+
 
 def compute_metrics(pred: NDArray[np.float32], target: NDArray[np.float32]) -> Dict[str, Dict[str, float]]:
     diff = pred - target
@@ -1106,9 +1266,19 @@ class OptimisationLogger:
             "params": params,
         }
         self.records.append(record)
+        param_parts: List[str] = []
+        for label in self.labels:
+            slot = params.get(label)
+            if not slot:
+                continue
+            param_parts.append(
+                f"{label}(sigma={slot['sigma']:.4f}, epsilon={slot['epsilon']:.4f})"
+            )
         msg = f"[{stage}] loss_total={metrics['loss']['total']:.6f} r2_total={metrics['r2']['total']}"
         if iteration is not None:
             msg = f"{msg} (iter={iteration})"
+        if param_parts:
+            msg = f"{msg} | " + ", ".join(param_parts)
         print(msg)
         self._update_best(metrics["loss"]["total"], params, iteration, stage)
         self._print_best()
@@ -1163,8 +1333,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sigma-min", type=float, default=0.1)
     parser.add_argument("--sigma-max", type=float, default=0.5)
     parser.add_argument("--epsilon-min", type=float, default=0.01)
-    parser.add_argument("--epsilon-max", type=float, default=5.0)
-    parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--epsilon-max", type=float, default=10.0)
+    parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument(
         "--device",
         choices=("cpu", "gpu"),
@@ -1172,8 +1342,28 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Device for LJ force evaluation (GPU requires torch with CUDA)",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-2, help="Learning rate for the GPU optimiser")
-    parser.add_argument("--patience", type=int, default=500, help="Early stopping patience for both optimisers")
-    parser.add_argument("--log-interval", type=int, default=5, help="Iterations between optimisation log entries")
+    parser.add_argument("--patience", type=int, default=1000, help="Early stopping patience for both optimisers")
+    parser.add_argument("--log-interval", type=int, default=100, help="Iterations between optimisation log entries")
+    # === 新增：退火相关参数 ===
+    parser.add_argument(
+        "--anneal-init",
+        type=float,
+        default=0.02,
+        help="Initial noise scale for simulated annealing (0 to disable)",
+    )
+    parser.add_argument(
+        "--anneal-final",
+        type=float,
+        default=0.0,
+        help="Final noise scale for simulated annealing",
+    )
+    parser.add_argument(
+        "--anneal-power",
+        type=float,
+        default=1.0,
+        help="Annealing schedule power (1.0=线性, 2.0=快降, <1=慢降)",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -1232,6 +1422,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary, entries, device=args.device, lj_targets=lj_targets
     )
     refresh_prepared_topologies(prepared_entries, summary)
+    linear_system, sigma_all_summary, epsilon_all_summary = build_linearized_lj_system(
+        prepared_entries, summary, args.rvdw
+    )
+    trainable_summary_indices = [slot.summary_index for slot in lj_targets]
 
     logger = OptimisationLogger([item.label for item in lj_targets])
 
@@ -1244,14 +1438,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     initial_metrics = compute_metrics(initial_pred, targets)
     logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0))
 
-    use_gpu_optimizer = (
-        args.device.lower() == "gpu" and torch is not None and torch.cuda.is_available()
-    )
+    use_torch_optimizer = torch is not None
     result_meta: Dict[str, object]
-    if use_gpu_optimizer:
-        sigma_opt, epsilon_opt, result_meta = run_gpu_optimizer(
-            prepared_entries,
-            targets,
+    if use_torch_optimizer:
+        sigma_opt, epsilon_opt, result_meta = run_linearized_torch_optimizer(
+            linear_system,
+            sigma_all_summary,
+            epsilon_all_summary,
+            trainable_summary_indices,
             sigma0,
             epsilon0,
             args,
@@ -1361,6 +1555,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(f"[DONE] Optimised summary written to {args.output_summary}")
     print(f"[DONE] Optimisation log written to {args.log}")
+    # Optional: plot loss and R^2 vs iteration
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # 💡 关键：切到非交互式后端
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        print(f"[WARN] matplotlib is not available or backend failed: {e}")
+    else:
+        # 从 logger.records 里取出所有 'iteration' 阶段的数据
+        steps = []
+        losses = []
+        r2_values = []
+        for rec in logger.records:
+            if rec.get("stage") != "iteration":
+                continue
+            it = rec.get("iteration")
+            if it is None:
+                continue
+            steps.append(int(it))
+            losses.append(float(rec["loss"]["total"]))
+            r2_values.append(float(rec["r2"]["total"]))
+
+        if steps:
+            # 按 step 排序一下
+            order = sorted(range(len(steps)), key=lambda i: steps[i])
+            steps_sorted = [steps[i] for i in order]
+            losses_sorted = [losses[i] for i in order]
+            r2_sorted = [r2_values[i] for i in order]
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(6, 6))
+
+            ax1.plot(steps_sorted, losses_sorted, marker="o")
+            ax1.set_ylabel("Loss (total)")
+            ax1.grid(True, alpha=0.3)
+
+            ax2.plot(steps_sorted, r2_sorted, marker="o")
+            ax2.set_xlabel("Iteration")
+            ax2.set_ylabel("R² (total)")
+            ax2.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            out_png = args.log.with_suffix(".png")
+            fig.savefig(out_png, dpi=150)
+            print(f"[DONE] Saved optimisation plot to {out_png}")
+        else:
+            print("[WARN] No iteration records found; skipping plots.")
+
     return 0
 
 
