@@ -72,6 +72,13 @@ class OptimisableLJEntry:
 
 
 @dataclass
+class OptimisableDihedralEntry:
+    summary_index: int
+    label: str
+    coeffs: Tuple[float, float, float, float, float, float]
+
+
+@dataclass
 class PreparedEntry:
     entry: CenterForceEntry
     topology: Topology
@@ -438,6 +445,26 @@ def select_optimisable_lj(summary: MutableMapping[str, object], fix_hydroxyl_h: 
     return entries
 
 
+def select_optimisable_dihedrals(summary: MutableMapping[str, object]) -> List[OptimisableDihedralEntry]:
+    entries: List[OptimisableDihedralEntry] = []
+    dihedral_list = summary.get("dihedrals", [])
+    if not isinstance(dihedral_list, list):
+        return entries
+    for idx, entry in enumerate(dihedral_list):
+        coeffs = entry.get("c")
+        if not isinstance(coeffs, Sequence) or len(coeffs) != 6:
+            continue
+        label = str(entry.get("pattern", f"dih_{idx}"))
+        entries.append(
+            OptimisableDihedralEntry(
+                summary_index=idx,
+                label=label,
+                coeffs=tuple(float(v) for v in coeffs),
+            )
+        )
+    return entries
+
+
 def _sync_topology_atomtypes(top: Topology, lj_list: Sequence[Mapping[str, object]]) -> None:
     for atom_type in top.atomtypes.values():
         idx = getattr(atom_type, "source_entry_idx", None)
@@ -528,8 +555,10 @@ def refresh_prepared_topologies(
     lj_list = summary.get("lj", [])
     if not isinstance(lj_list, Sequence):
         return
+    dihedral_list = summary.get("dihedrals", []) if isinstance(summary.get("dihedrals"), Sequence) else []
     for prepared in prepared_entries:
         _sync_topology_atomtypes(prepared.topology, lj_list)
+        _sync_topology_dihedrals(prepared.topology, dihedral_list)
 
 
 def _atomtype_summary_index(top: Topology, atom_idx: int) -> Optional[int]:
@@ -541,6 +570,22 @@ def _atomtype_summary_index(top: Topology, atom_idx: int) -> Optional[int]:
     if idx is None:
         return None
     return int(idx)
+
+
+def _sync_topology_dihedrals(top: Topology, dihedral_entries: Sequence[Mapping[str, object]]) -> None:
+    if not dihedral_entries:
+        return
+    for dih in top.rb_dihedrals:
+        src = getattr(dih, "source_entry_idx", None)
+        if src is None:
+            continue
+        if src < 0 or src >= len(dihedral_entries):
+            continue
+        entry = dihedral_entries[src]
+        coeffs = entry.get("c") if isinstance(entry, Mapping) else None
+        if not isinstance(coeffs, Sequence) or len(coeffs) != 6:
+            continue
+        dih.c = tuple(float(v) for v in coeffs)
 
 
 def _collect_center_lj_pairs(
@@ -704,6 +749,22 @@ def apply_lj_parameters(
         entry["epsilon"] = float(epsilon)
         entry["C6"] = float(4.0 * epsilon * (sigma ** 6))
         entry["C12"] = float(4.0 * epsilon * (sigma ** 12))
+
+
+def apply_dihedral_parameters(
+    summary: MutableMapping[str, object],
+    targets: Sequence[OptimisableDihedralEntry],
+    coeff_matrix: Sequence[Sequence[float]],
+) -> None:
+    dihedral_list = summary.get("dihedrals")
+    if not isinstance(dihedral_list, list):
+        raise ValueError("summary JSON missing 'dihedrals' list")
+    for slot, coeffs in zip(targets, coeff_matrix):
+        idx = slot.summary_index
+        if idx < 0 or idx >= len(dihedral_list):
+            continue
+        entry = dihedral_list[idx]
+        entry["c"] = [float(v) for v in coeffs]
 
 
 def compute_nonbonded_forces(
@@ -994,6 +1055,7 @@ def predict_forces(
     prepared_entries: Sequence[PreparedEntry],
     rvdw: float,
     device: str = "gpu",
+    recompute_dihedral: bool = False,
 ) -> NDArray[np.float32]:
     """
     用和 compare_plot_csv.py 一致的方式计算预测力。
@@ -1027,10 +1089,14 @@ def predict_forces(
         )
 
         idx = entry.center_index
+        if recompute_dihedral:
+            dihedral_force = compute_dihedral_forces(prepared.topology, entry.coords)
+        else:
+            dihedral_force = entry.dihedral_force_kj
         total_nb_kj = (
             forces_lj_kj[idx]
             + entry.coulomb_force_kj
-            + entry.dihedral_force_kj
+            + dihedral_force
         )
         total_kj = total_nb_kj + entry.bond_force_kj + entry.angle_force_kj
 
@@ -1241,8 +1307,9 @@ class EarlyStopping:
 
 
 class OptimisationLogger:
-    def __init__(self, labels: Sequence[str]):
-        self.labels = list(labels)
+    def __init__(self, lj_labels: Sequence[str], dihedral_labels: Optional[Sequence[str]] = None):
+        self.lj_labels = list(lj_labels)
+        self.dihedral_labels = list(dihedral_labels or [])
         self.records: List[Dict[str, object]] = []
         self.eval_counter = 0
         self.best_loss = math.inf
@@ -1250,11 +1317,17 @@ class OptimisationLogger:
         self.best_iteration_label: Optional[str] = None
 
     def snapshot_params(
-        self, sigma: Sequence[float], epsilon: Sequence[float]
+        self,
+        sigma: Sequence[float],
+        epsilon: Sequence[float],
+        dihedrals: Optional[Sequence[Sequence[float]]] = None,
     ) -> Dict[str, Dict[str, float]]:
         out = {}
-        for label, s, e in zip(self.labels, sigma, epsilon):
+        for label, s, e in zip(self.lj_labels, sigma, epsilon):
             out[label] = {"sigma": float(s), "epsilon": float(e)}
+        if dihedrals is not None:
+            for label, coeffs in zip(self.dihedral_labels, dihedrals):
+                out[label] = {f"c{i+1}": float(v) for i, v in enumerate(coeffs)}
         return out
 
     def log(self, stage: str, metrics: Dict[str, Dict[str, float]], params: Dict[str, Dict[str, float]], iteration: Optional[int] = None) -> None:
@@ -1267,13 +1340,19 @@ class OptimisationLogger:
         }
         self.records.append(record)
         param_parts: List[str] = []
-        for label in self.labels:
+        for label in self.lj_labels:
             slot = params.get(label)
             if not slot:
                 continue
             param_parts.append(
                 f"{label}(sigma={slot['sigma']:.4f}, epsilon={slot['epsilon']:.4f})"
             )
+        for label in self.dihedral_labels:
+            slot = params.get(label)
+            if not slot:
+                continue
+            coeff_desc = ", ".join(f"c{i+1}={slot.get(f'c{i+1}', float('nan')):.3f}" for i in range(6))
+            param_parts.append(f"{label}({coeff_desc})")
         msg = f"[{stage}] loss_total={metrics['loss']['total']:.6f} r2_total={metrics['r2']['total']}"
         if iteration is not None:
             msg = f"{msg} (iter={iteration})"
@@ -1334,6 +1413,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sigma-max", type=float, default=0.5)
     parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--epsilon-max", type=float, default=10.0)
+    parser.add_argument("--optimize-dihedrals", action="store_true")
+    parser.add_argument("--dihedral-min", type=float, default=-10.0)
+    parser.add_argument("--dihedral-max", type=float, default=10.0)
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument(
         "--device",
@@ -1412,10 +1494,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     apply_cached_component(entries, dihedral_cache, "dihedral_force_kj")
 
     lj_targets = select_optimisable_lj(summary, fix_hydroxyl_h=True)
+    dihedral_targets = select_optimisable_dihedrals(summary) if args.optimize_dihedrals else []
+    if args.optimize_dihedrals and not dihedral_targets:
+        raise ValueError("No dihedral parameters available for optimisation")
     sigma0 = np.array([item.sigma for item in lj_targets], dtype=float)
     epsilon0 = np.array([item.epsilon for item in lj_targets], dtype=float)
+    dihedral0 = np.array([item.coeffs for item in dihedral_targets], dtype=float)
 
     apply_lj_parameters(summary, lj_targets, sigma0, epsilon0)
+    if dihedral_targets:
+        apply_dihedral_parameters(summary, dihedral_targets, dihedral0)
     targets = np.vstack([entry.target_force for entry in entries])
 
     prepared_entries = prepare_entries_for_prediction(
@@ -1427,18 +1515,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     trainable_summary_indices = [slot.summary_index for slot in lj_targets]
 
-    logger = OptimisationLogger([item.label for item in lj_targets])
+    logger = OptimisationLogger([item.label for item in lj_targets], [d.label for d in dihedral_targets])
 
     initial_pred = predict_forces(
         summary,
         prepared_entries,
         rvdw=args.rvdw,
         device=args.device,
+        recompute_dihedral=bool(dihedral_targets),
     )
     initial_metrics = compute_metrics(initial_pred, targets)
-    logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0))
+    logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0, dihedral0))
 
-    use_torch_optimizer = torch is not None
+    use_torch_optimizer = torch is not None and not dihedral_targets
     result_meta: Dict[str, object]
     if use_torch_optimizer:
         sigma_opt, epsilon_opt, result_meta = run_linearized_torch_optimizer(
@@ -1457,32 +1546,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             bounds.append((args.sigma_min, args.sigma_max))
         for _ in lj_targets:
             bounds.append((args.epsilon_min, args.epsilon_max))
+        for _ in dihedral_targets:
+            bounds.extend([(args.dihedral_min, args.dihedral_max)] * 6)
 
-        def _pack(s: NDArray[np.float32], e: NDArray[np.float32]) -> NDArray[np.float32]:
-            return np.concatenate([s, e])
+        def _pack(
+            s: NDArray[np.float32], e: NDArray[np.float32], d: Optional[NDArray[np.float32]] = None
+        ) -> NDArray[np.float32]:
+            parts: List[np.ndarray] = [s, e]
+            if dihedral_targets:
+                d_arr = dihedral0 if d is None else np.asarray(d, dtype=float)
+                parts.append(d_arr.reshape(-1))
+            return np.concatenate(parts)
 
-        def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
+        def _unpack(
+            vec: Sequence[float],
+        ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
             vec = np.asarray(vec, dtype=float)
             n = len(lj_targets)
-            return vec[:n], vec[n:]
+            s = vec[:n]
+            e = vec[n : 2 * n]
+            d: NDArray[np.float32] = np.empty((0, 6), dtype=float)
+            if dihedral_targets:
+                d = vec[2 * n :].reshape((-1, 6))
+            return s, e, d
 
         best_state = {
             "loss": float(initial_metrics["loss"]["total"]),
-            "vec": _pack(sigma0, epsilon0),
+            "vec": _pack(sigma0, epsilon0, dihedral0),
         }
         early_stopper = EarlyStopping(
             patience=int(args.patience), initial_loss=best_state["loss"], min_delta=1e-9
         )
 
         def objective(vec: Sequence[float]) -> float:
-            sigma, epsilon = _unpack(vec)
+            sigma, epsilon, dihedrals = _unpack(vec)
             apply_lj_parameters(summary, lj_targets, sigma, epsilon)
+            if dihedral_targets:
+                apply_dihedral_parameters(summary, dihedral_targets, dihedrals)
             refresh_prepared_topologies(prepared_entries, summary)
             pred = predict_forces(
                 summary,
                 prepared_entries,
                 rvdw=args.rvdw,
                 device=args.device,
+                recompute_dihedral=bool(dihedral_targets),
             )
             metrics = compute_metrics(pred, targets)
             logger.eval_counter += 1
@@ -1490,14 +1597,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 logger.log(
                     "iteration",
                     metrics,
-                    logger.snapshot_params(sigma, epsilon),
+                    logger.snapshot_params(sigma, epsilon, dihedrals if dihedral_targets else None),
                     iteration=logger.eval_counter,
                 )
 
             loss_value = metrics["loss"]["total"]
             if loss_value < best_state["loss"] - 1e-12:
                 best_state["loss"] = loss_value
-                best_state["vec"] = _pack(sigma, epsilon)
+                best_state["vec"] = _pack(sigma, epsilon, dihedrals)
             if early_stopper.update(loss_value):
                 raise EarlyStopException(
                     f"No improvement for {args.patience} evaluations; stopping early."
@@ -1507,7 +1614,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             result = minimize(
                 objective,
-                _pack(sigma0, epsilon0),
+                _pack(sigma0, epsilon0, dihedral0),
                 method="L-BFGS-B",
                 bounds=bounds,
                 options={"maxiter": args.max_iter, "disp": True},
@@ -1522,7 +1629,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 nit=int(logger.eval_counter),
             )
 
-        sigma_opt, epsilon_opt = _unpack(best_state["vec"])
+        sigma_opt, epsilon_opt, dihedral_opt = _unpack(best_state["vec"])
         result_meta = {
             "method": "L-BFGS-B",
             "success": bool(result.success),
@@ -1531,15 +1638,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "nit": int(result.nit),
         }
     apply_lj_parameters(summary, lj_targets, sigma_opt, epsilon_opt)
+    if dihedral_targets:
+        apply_dihedral_parameters(summary, dihedral_targets, dihedral_opt)
     refresh_prepared_topologies(prepared_entries, summary)
     final_pred = predict_forces(
         summary,
         prepared_entries,
         rvdw=args.rvdw,
         device=args.device,
+        recompute_dihedral=bool(dihedral_targets),
     )
     final_metrics = compute_metrics(final_pred, targets)
-    logger.log("final", final_metrics, logger.snapshot_params(sigma_opt, epsilon_opt))
+    logger.log(
+        "final",
+        final_metrics,
+        logger.snapshot_params(sigma_opt, epsilon_opt, dihedral_opt if dihedral_targets else None),
+    )
 
     with args.output_summary.open("w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2)
