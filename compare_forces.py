@@ -10,7 +10,7 @@ from itertools import combinations
 from pathlib import Path
 from dataclasses import dataclass
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, MutableMapping, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Set, Tuple
 
 try:  # pragma: no cover - 环境可能缺失 numpy
     import numpy as np  # type: ignore
@@ -50,6 +50,7 @@ class AtomType:
     epsilon: float
     C6: float
     C12: float
+    source_entry_idx: Optional[int] = None
 
 @dataclass
 class Atom:
@@ -226,7 +227,7 @@ def parse_itp(itp_path: str) -> Topology:
                 sigma=float(toks[-2]); epsilon=float(toks[-1])
                 C6 = 4.0*epsilon*(sigma**6)
                 C12= 4.0*epsilon*(sigma**12)
-                atomtypes[name]=AtomType(name,sigma,epsilon,C6,C12)
+                atomtypes[name]=AtomType(name,sigma,epsilon,C6,C12, source_entry_idx=None)
             continue
 
         if sec=='atoms':
@@ -333,6 +334,7 @@ def topology_from_dict(data: MutableMapping[str, object]) -> Topology:
             epsilon=values["epsilon"],
             C6=values["C6"],
             C12=values["C12"],
+            source_entry_idx=None,
         )
         for name, values in data["atomtypes"].items()
     }
@@ -680,8 +682,9 @@ def _match_dihedral_entry(
     pattern: str,
     canon_pattern: str,
     variant: str,
-    dihedral_lookup: Dict[Tuple[str, str], List[dict]],
-) -> dict:
+    dihedral_lookup: Dict[Tuple[str, str], List[Tuple[int, dict]]],
+) -> Tuple[int, dict]:
+# ) -> dict:
     options = dihedral_lookup.get((canon_pattern, variant))
     if not options:
         # 尝试回退到不区分羟基的参数
@@ -690,10 +693,11 @@ def _match_dihedral_entry(
         raise KeyError(f"缺少二面角参数：{canon_pattern} ({variant})")
     if len(options) == 1:
         return options[0]
-    for entry in options:
+    for item in options:
+        idx, entry = item        
         eq = entry.get("equivalent_patterns", [])
         if pattern in eq or pattern[::-1] in eq:
-            return entry
+            return item
     return options[0]
 
 
@@ -768,6 +772,7 @@ def infer_topology_from_summary(
                 epsilon=float(entry["epsilon"]),
                 C6=float(entry.get("C6", 0.0)),
                 C12=float(entry.get("C12", 0.0)),
+                source_entry_idx=entry_index,
             )
             entry_to_type_name[entry_index] = type_name
         atoms.append(
@@ -809,10 +814,10 @@ def infer_topology_from_summary(
                 )
             )
 
-    dihedral_lookup: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
-    for entry in summary.get("dihedrals", []):
+    dihedral_lookup: Dict[Tuple[str, str], List[Tuple[int, dict]]] = defaultdict(list)
+    for idx, entry in enumerate(summary.get("dihedrals", [])):
         variant = entry.get("hydroxyl_variant", "none")
-        dihedral_lookup[(entry.get("symmetry_key", entry.get("pattern")), variant)].append(entry)
+        dihedral_lookup[(entry.get("symmetry_key", entry.get("pattern")), variant)].append(idx,entry)
 
     rb_dihedrals: List[RB_Dihedral] = []
     seen_dihedrals: Set[Tuple[int, int, int, int]] = set()
@@ -841,7 +846,7 @@ def infer_topology_from_summary(
                     if not forward:
                         left_h, right_h = right_h, left_h
                     variant = _dihedral_variant_label(left_h, right_h)
-                    entry = _match_dihedral_entry(pattern, canon_pattern, variant, dihedral_lookup)
+                    entry_idx, entry = _match_dihedral_entry(pattern, canon_pattern, variant, dihedral_lookup)
                     rb_dihedrals.append(
                         RB_Dihedral(
                             i=i_idx,
@@ -852,7 +857,8 @@ def infer_topology_from_summary(
                             c=tuple(float(v) for v in entry["c"]),
                         )
                     )
-
+                    rb_dihedrals[-1].source_entry_idx = int(entry_idx)
+                    
     pairs14: Set[Tuple[int, int]] = set()
     for dih in rb_dihedrals:
         a, b = dih.i, dih.l
