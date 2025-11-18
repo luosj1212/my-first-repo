@@ -92,6 +92,7 @@ class PreparedEntry:
     coulomb_force_gpu: Optional[Any] = None
     dihedral_force_gpu: Optional[Any] = None
     temperature_factor_gpu: Optional[Any] = None
+    dihedral_param_index: Optional[Any] = None
 
 
 @dataclass
@@ -487,11 +488,15 @@ def prepare_entries_for_prediction(
     entries: Sequence[CenterForceEntry],
     device: str,
     lj_targets: Sequence[OptimisableLJEntry],
+    dihedral_targets: Optional[Sequence[OptimisableDihedralEntry]] = None,
 ) -> List[PreparedEntry]:
     prepared: List[PreparedEntry] = []
     use_gpu = device.lower() == "gpu" and torch is not None and torch.cuda.is_available()
     gpu_device = torch.device("cuda") if use_gpu else None
     target_lookup = {slot.summary_index: idx for idx, slot in enumerate(lj_targets)}
+    dihedral_lookup = {
+        slot.summary_index: idx for idx, slot in enumerate(dihedral_targets or [])
+    }
 
     for entry in entries:
         top = infer_topology_from_summary(summary, entry.coords, entry.atom_types)
@@ -507,6 +512,7 @@ def prepare_entries_for_prediction(
         coulomb_force_gpu = None
         dihedral_force_gpu = None
         temp_factor_gpu = None
+        dihedral_param_tensor = None
         if use_gpu:
             coords_gpu = torch.as_tensor(entry.coords, dtype=torch.float32, device=gpu_device)
             atom_param_idx = np.full(len(top.atoms), -1, dtype=np.int64)
@@ -530,6 +536,18 @@ def prepare_entries_for_prediction(
             coulomb_force_gpu = torch.as_tensor(entry.coulomb_force_kj, dtype=torch.float32, device=gpu_device)
             dihedral_force_gpu = torch.as_tensor(entry.dihedral_force_kj, dtype=torch.float32, device=gpu_device)
             temp_factor_gpu = torch.tensor(factor, dtype=torch.float32, device=gpu_device)
+            if top.rb_dihedrals:
+                dih_param_idx = np.full(len(top.rb_dihedrals), -1, dtype=np.int64)
+                for dih_idx, dih in enumerate(top.rb_dihedrals):
+                    src = getattr(dih, "source_entry_idx", None)
+                    if src is None:
+                        continue
+                    mapped = dihedral_lookup.get(int(src))
+                    if mapped is not None:
+                        dih_param_idx[dih_idx] = int(mapped)
+                dihedral_param_tensor = torch.as_tensor(
+                    dih_param_idx, dtype=torch.long, device=gpu_device
+                )
         prepared.append(
             PreparedEntry(
                 entry=entry,
@@ -544,6 +562,7 @@ def prepare_entries_for_prediction(
                 coulomb_force_gpu=coulomb_force_gpu,
                 dihedral_force_gpu=dihedral_force_gpu,
                 temperature_factor_gpu=temp_factor_gpu,
+                dihedral_param_index=dihedral_param_tensor,
             )
         )
     return prepared
@@ -1050,6 +1069,97 @@ def compute_dihedral_forces(
     return forces
 
 
+def compute_dihedral_forces_torch(
+    top: Topology,
+    coords: "torch.Tensor",
+    dihedral_params: Optional["torch.Tensor"] = None,
+    dihedral_param_index: Optional["torch.Tensor"] = None,
+) -> "torch.Tensor":
+    if torch is None:
+        raise RuntimeError("Torch is required for dihedral force evaluation")
+
+    device = coords.device
+    dtype = coords.dtype
+    n = coords.shape[0]
+    forces = torch.zeros((n, 3), dtype=dtype, device=device)
+
+    for dih_idx, dih in enumerate(top.rb_dihedrals):
+        i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
+
+        b1 = coords[i] - coords[j]
+        b2 = coords[k] - coords[j]
+        b3 = coords[l] - coords[k]
+
+        c1 = torch.cross(b2, b3, dim=-1)
+        c2 = torch.cross(b1, b2, dim=-1)
+
+        nb2 = torch.clamp(torch.linalg.norm(b2), min=1e-12)
+        nc1 = torch.clamp(torch.linalg.norm(c1), min=1e-12)
+        nc2 = torch.clamp(torch.linalg.norm(c2), min=1e-12)
+
+        x = torch.dot(c2, c1)
+        y = nb2 * torch.dot(b1, c1)
+        phi = torch.atan2(y, x)
+
+        if dihedral_params is not None and dihedral_param_index is not None:
+            param_idx = int(dihedral_param_index[dih_idx]) if dih_idx < len(dihedral_param_index) else -1
+        else:
+            param_idx = -1
+        if param_idx >= 0 and dihedral_params is not None:
+            coeffs = dihedral_params[param_idx]
+        else:
+            coeffs = torch.tensor(dih.c, dtype=dtype, device=device)
+
+        cosp = torch.cos(phi)
+        sinp = torch.sin(phi)
+        s = torch.zeros((), dtype=dtype, device=device)
+        cp = torch.ones((), dtype=dtype, device=device)
+        for n_ in range(1, 6):
+            s = s + n_ * coeffs[n_] * cp
+            cp = cp * cosp
+        dVdphi = -sinp * s
+
+        dphi_di = (nb2 / (nc2 * nc2)) * c2
+        dphi_dl = (nb2 / (nc1 * nc1)) * c1
+
+        db1b2 = torch.dot(b1, b2)
+        db3b2 = torch.dot(b3, b2)
+        term_j1 = (db1b2 / nb2) / (nc2 * nc2)
+        term_j2 = torch.dot(b1, c2) / (nc2 * nc2)
+        term_l1 = (db3b2 / nb2) / (nc1 * nc1)
+        term_l2 = torch.dot(b3, c1) / (nc1 * nc1)
+
+        dphi_dj = term_j1 * c2 - term_j2 * torch.cross(b1, b2) / nb2
+        dphi_dk = term_l1 * c1 + term_l2 * torch.cross(b3, b2) / nb2
+        dphi_dk = -(dphi_di + dphi_dj + dphi_dk)
+
+        Fi = -dVdphi * dphi_di
+        Fj = -dVdphi * dphi_dj
+        Fk = -dVdphi * dphi_dk
+        Fl = -dVdphi * dphi_dl
+
+        m = 0.5 * (coords[j] + coords[k])
+        ri, rj, rk, rl = coords[i] - m, coords[j] - m, coords[k] - m, coords[l] - m
+        tau = (torch.cross(ri, Fi, dim=-1)
+            + torch.cross(rj, Fj, dim=-1)
+            + torch.cross(rk, Fk, dim=-1)
+            + torch.cross(rl, Fl, dim=-1))
+        cross_bt = torch.cross(b2, tau, dim=-1)
+
+        denom = torch.dot(b2, b2) + 1e-30
+        Delta = -cross_bt / denom
+
+        Fj = Fj + Delta
+        Fk = Fk - Delta
+
+        forces[i] += Fi
+        forces[j] += Fj
+        forces[k] += Fk
+        forces[l] += Fl
+
+    return forces
+
+
 def predict_forces(
     summary: MutableMapping[str, object],
     prepared_entries: Sequence[PreparedEntry],
@@ -1090,13 +1200,23 @@ def predict_forces(
 
         idx = entry.center_index
         if recompute_dihedral:
-            dihedral_force = compute_dihedral_forces(prepared.topology, entry.coords)
+            if use_gpu and prepared.coords_gpu is not None and torch is not None:
+                dih_force_t = compute_dihedral_forces_torch(prepared.topology, prepared.coords_gpu)
+                dihedral_force_full = dih_force_t.detach().cpu().numpy()
+            else:
+                dihedral_force_full = compute_dihedral_forces(prepared.topology, entry.coords)
+            dihedral_center = dihedral_force_full[idx]
+
         else:
-            dihedral_force = entry.dihedral_force_kj
+            dihedral_center = (
+                prepared.dihedral_force_gpu.detach().cpu().numpy()
+                if use_gpu and prepared.dihedral_force_gpu is not None
+                else entry.dihedral_force_kj
+            )
         total_nb_kj = (
             forces_lj_kj[idx]
             + entry.coulomb_force_kj
-            + dihedral_force
+            + dihedral_center
         )
         total_kj = total_nb_kj + entry.bond_force_kj + entry.angle_force_kj
 
@@ -1251,8 +1371,202 @@ def run_linearized_torch_optimizer(
         "nfev": int(logger.eval_counter),
         "nit": int(logger.eval_counter),
         "device": device.type,
-    }
+    } 
     return best_sigma, best_epsilon, meta
+
+
+def run_torch_force_optimizer(
+    prepared_entries: Sequence[PreparedEntry],
+    lj_targets: Sequence[OptimisableLJEntry],
+    dihedral_targets: Sequence[OptimisableDihedralEntry],
+    sigma0: NDArray[np.float32],
+    epsilon0: NDArray[np.float32],
+    dihedral0: NDArray[np.float32],
+    targets: NDArray[np.float32],
+    args: argparse.Namespace,
+    logger: OptimisationLogger,
+) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], Dict[str, object]]:
+    if torch is None:
+        raise RuntimeError("Torch is required for GPU force optimisation")
+    want_gpu = args.device.lower() == "gpu"
+    if want_gpu and not torch.cuda.is_available():
+        print("[GPU] CUDA not available; falling back to CPU tensors for optimisation.")
+    device = torch.device("cuda" if want_gpu and torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+
+    lj_lookup = {slot.summary_index: idx for idx, slot in enumerate(lj_targets)}
+    dihedral_lookup = {
+        slot.summary_index: idx for idx, slot in enumerate(dihedral_targets)
+    }
+    target_t = torch.as_tensor(targets, dtype=dtype, device=device)
+
+    sigma_param = torch.nn.Parameter(torch.as_tensor(sigma0, dtype=dtype, device=device))
+    epsilon_param = torch.nn.Parameter(torch.as_tensor(epsilon0, dtype=dtype, device=device))
+    dihedral_param = torch.nn.Parameter(torch.as_tensor(dihedral0, dtype=dtype, device=device))
+    optimizer = torch.optim.Adam(
+        [sigma_param, epsilon_param, dihedral_param], lr=float(args.learning_rate)
+    )
+    early_stopper = EarlyStopping(
+        patience=int(args.patience), initial_loss=float("inf"), min_delta=1e-9
+    )
+    best_sigma = sigma0.copy()
+    best_epsilon = epsilon0.copy()
+    best_dihedral = dihedral0.copy()
+    best_loss = float("inf")
+
+    def assemble_atom_params(
+        top: Topology, sigma_values: "torch.Tensor", epsilon_values: "torch.Tensor"
+    ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        sigma_list: List[float] = []
+        epsilon_list: List[float] = []
+        for atom in top.atoms:
+            atom_type = top.atomtypes[atom.type_name]
+            src_idx = getattr(atom_type, "source_entry_idx", None)
+            if src_idx is not None and int(src_idx) in lj_lookup:
+                mapped = lj_lookup[int(src_idx)]
+                sigma_list.append(float(sigma_values[mapped]))
+                epsilon_list.append(float(epsilon_values[mapped]))
+            else:
+                sigma_list.append(float(atom_type.sigma))
+                epsilon_list.append(float(atom_type.epsilon))
+        return (
+            torch.tensor(sigma_list, dtype=dtype, device=device),
+            torch.tensor(epsilon_list, dtype=dtype, device=device),
+        )
+
+    def dihedral_index_tensor(prepared: PreparedEntry) -> Optional["torch.Tensor"]:
+        if prepared.dihedral_param_index is None:
+            if prepared.topology.rb_dihedrals:
+                idx = [
+                    dihedral_lookup.get(getattr(d, "source_entry_idx", -1), -1)
+                    for d in prepared.topology.rb_dihedrals
+                ]
+                return torch.as_tensor(idx, dtype=torch.long, device=device)
+            return None
+        return prepared.dihedral_param_index.to(device=device)
+
+    for iteration in range(1, int(args.max_iter) + 1):
+        optimizer.zero_grad()
+
+        sigma_clamped = torch.clamp(
+            sigma_param, min=float(args.sigma_min), max=float(args.sigma_max)
+        )
+        epsilon_clamped = torch.clamp(
+            epsilon_param, min=float(args.epsilon_min), max=float(args.epsilon_max)
+        )
+        dihedral_clamped = torch.clamp(
+            dihedral_param,
+            min=float(args.dihedral_min),
+            max=float(args.dihedral_max),
+        )
+
+        preds: List["torch.Tensor"] = []
+        for prepared in prepared_entries:
+            entry = prepared.entry
+            coords_t = (
+                prepared.coords_gpu.to(device=device)
+                if prepared.coords_gpu is not None
+                else torch.as_tensor(entry.coords, dtype=dtype, device=device)
+            )
+            sigma_atoms, epsilon_atoms = assemble_atom_params(
+                prepared.topology, sigma_clamped, epsilon_clamped
+            )
+            dih_idx = dihedral_index_tensor(prepared)
+            forces_lj = compute_nonbonded_forces(
+                prepared.topology,
+                coords_t,
+                rcoul=0.0,
+                rvdw=args.rvdw,
+                do_lj=True,
+                do_coul=False,
+                device="gpu" if want_gpu else "cpu",
+                sigma_override=sigma_atoms,
+                epsilon_override=epsilon_atoms,
+                return_numpy=False,
+            )
+            dihedral_force = compute_dihedral_forces_torch(
+                prepared.topology,
+                coords_t,
+                dihedral_params=dihedral_clamped,
+                dihedral_param_index=dih_idx,
+            )
+
+            coulomb = (
+                prepared.coulomb_force_gpu.to(device=device)
+                if prepared.coulomb_force_gpu is not None
+                else torch.as_tensor(entry.coulomb_force_kj, dtype=dtype, device=device)
+            )
+            bond = (
+                prepared.bond_force_gpu.to(device=device)
+                if prepared.bond_force_gpu is not None
+                else torch.as_tensor(entry.bond_force_kj, dtype=dtype, device=device)
+            )
+            angle = (
+                prepared.angle_force_gpu.to(device=device)
+                if prepared.angle_force_gpu is not None
+                else torch.as_tensor(entry.angle_force_kj, dtype=dtype, device=device)
+            )
+
+            total_nb = forces_lj[entry.center_index] + coulomb + dihedral_force[entry.center_index]
+            total = total_nb + bond + angle
+            temp_factor = (
+                prepared.temperature_factor_gpu.to(device=device)
+                if prepared.temperature_factor_gpu is not None
+                else torch.tensor(prepared.temperature_factor, dtype=dtype, device=device)
+            )
+            preds.append(total * temp_factor)
+
+        pred_t = torch.stack(preds, dim=0)
+        loss_tensor = torch.mean((pred_t - target_t) ** 2)
+
+        if not torch.isfinite(loss_tensor):
+            print(f"[ERROR] Non-finite loss encountered at iteration {iteration}")
+            break
+
+        loss_tensor.backward()
+        optimizer.step()
+
+        loss_value = float(loss_tensor.item())
+        logger.eval_counter += 1
+
+        if loss_value + 1e-12 < best_loss:
+            best_loss = loss_value
+            best_sigma = sigma_clamped.detach().cpu().numpy()
+            best_epsilon = epsilon_clamped.detach().cpu().numpy()
+            best_dihedral = dihedral_clamped.detach().cpu().numpy()
+
+        if iteration % max(int(args.log_interval), 1) == 0:
+            metrics = compute_metrics(
+                pred_t.detach().cpu().numpy().astype(np.float32), targets
+            )
+            logger.log(
+                "iteration",
+                metrics,
+                logger.snapshot_params(
+                    sigma_clamped.detach().cpu().numpy(),
+                    epsilon_clamped.detach().cpu().numpy(),
+                    dihedral_clamped.detach().cpu().numpy(),
+                ),
+                iteration=iteration,
+            )
+
+        if early_stopper.best_loss is math.inf:
+            early_stopper.best_loss = loss_value
+        if early_stopper.update(loss_value):
+            print(
+                f"[EARLY STOP GPU] No improvement for {args.patience} iterations; stopping optimisation."
+            )
+            break
+
+    meta = {
+        "method": "TorchAdamForces",
+        "success": True,
+        "message": "Torch LJ+dihedral optimisation completed",
+        "nfev": int(logger.eval_counter),
+        "nit": int(logger.eval_counter),
+        "device": device.type,
+    }
+    return best_sigma, best_epsilon, best_dihedral, meta
 
 
 def compute_metrics(pred: NDArray[np.float32], target: NDArray[np.float32]) -> Dict[str, Dict[str, float]]:
@@ -1382,7 +1696,7 @@ class OptimisationLogger:
         if not self.best_params_snapshot:
             return
         parts = []
-        for label in self.labels:
+        for label in self.lj_labels:
             params = self.best_params_snapshot.get(label)
             if not params:
                 continue
@@ -1507,7 +1821,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     targets = np.vstack([entry.target_force for entry in entries])
 
     prepared_entries = prepare_entries_for_prediction(
-        summary, entries, device=args.device, lj_targets=lj_targets
+        summary,
+        entries,
+        device=args.device,
+        lj_targets=lj_targets,
+        dihedral_targets=dihedral_targets,
     )
     refresh_prepared_topologies(prepared_entries, summary)
     linear_system, sigma_all_summary, epsilon_all_summary = build_linearized_lj_system(
@@ -1527,19 +1845,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     initial_metrics = compute_metrics(initial_pred, targets)
     logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0, dihedral0))
 
-    use_torch_optimizer = torch is not None and not dihedral_targets
+    use_torch_optimizer = torch is not None and args.device.lower() == "gpu"
     result_meta: Dict[str, object]
     if use_torch_optimizer:
-        sigma_opt, epsilon_opt, result_meta = run_linearized_torch_optimizer(
-            linear_system,
-            sigma_all_summary,
-            epsilon_all_summary,
-            trainable_summary_indices,
-            sigma0,
-            epsilon0,
-            args,
-            logger,
-        )
+        if dihedral_targets:
+            sigma_opt, epsilon_opt, dihedral_opt, result_meta = run_torch_force_optimizer(
+                prepared_entries,
+                lj_targets,
+                dihedral_targets,
+                sigma0,
+                epsilon0,
+                dihedral0,
+                targets,
+                args,
+                logger,
+            )
+        else:
+            sigma_opt, epsilon_opt, result_meta = run_linearized_torch_optimizer(
+                linear_system,
+                sigma_all_summary,
+                epsilon_all_summary,
+                trainable_summary_indices,
+                sigma0,
+                epsilon0,
+                args,
+                logger,
+            )
+            dihedral_opt = dihedral0
     else:
         bounds: List[Tuple[float, float]] = []
         for _ in lj_targets:
