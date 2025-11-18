@@ -1572,13 +1572,42 @@ def run_torch_force_optimizer(
     best_dihedral = dihedral0.copy()
     best_loss = float("inf")
 
-    def assemble_atom_params(
-        top: Topology, sigma_values: "torch.Tensor", epsilon_values: "torch.Tensor"
+    def build_lj_params_for_entry(
+        prepared: PreparedEntry,
+        sigma_values: "torch.Tensor",
+        epsilon_values: "torch.Tensor",
     ) -> Tuple["torch.Tensor", "torch.Tensor"]:
+        """
+        从 PreparedEntry 缓存里根据 atom_param_index 重建 LJ per-atom 参数。
+
+        sigma_values/epsilon_values 是当前优化参数（已经 clamp），这里用
+        prepared.atom_param_index 映射出需要更新的 atom，再覆盖到常数 sigma/epsilon
+        的副本上。整个过程只使用 GPU/当前 device 的 tensor，避免迭代中重复的
+        Python 循环和 numpy -> torch 转换。
+        """
+
+        atom_param_index = prepared.atom_param_index
+        sigma_const = prepared.sigma_constant_gpu
+        epsilon_const = prepared.epsilon_constant_gpu
+
+        if atom_param_index is not None and sigma_const is not None and epsilon_const is not None:
+            idx = atom_param_index.to(device=device)
+            sigma_atoms = sigma_const.to(device=device)
+            epsilon_atoms = epsilon_const.to(device=device)
+            trainable_mask = idx >= 0
+            if trainable_mask.any():
+                mapped_idx = idx[trainable_mask]
+                sigma_atoms = sigma_atoms.clone()
+                epsilon_atoms = epsilon_atoms.clone()
+                sigma_atoms[trainable_mask] = sigma_values[mapped_idx]
+                epsilon_atoms[trainable_mask] = epsilon_values[mapped_idx]
+            return sigma_atoms, epsilon_atoms
+
+        # 回退路径：没有 GPU 缓存时保持旧逻辑，但尽量只做一次 tensor 构造。
         sigma_list: List[float] = []
         epsilon_list: List[float] = []
-        for atom in top.atoms:
-            atom_type = top.atomtypes[atom.type_name]
+        for atom in prepared.topology.atoms:
+            atom_type = prepared.topology.atomtypes[atom.type_name]
             src_idx = getattr(atom_type, "source_entry_idx", None)
             if src_idx is not None and int(src_idx) in lj_lookup:
                 mapped = lj_lookup[int(src_idx)]
@@ -1592,16 +1621,19 @@ def run_torch_force_optimizer(
             torch.tensor(epsilon_list, dtype=dtype, device=device),
         )
 
-    def dihedral_index_tensor(prepared: PreparedEntry) -> Optional["torch.Tensor"]:
-        if prepared.dihedral_param_index is None:
-            if prepared.topology.rb_dihedrals:
-                idx = [
-                    dihedral_lookup.get(getattr(d, "source_entry_idx", -1), -1)
-                    for d in prepared.topology.rb_dihedrals
-                ]
-                return torch.as_tensor(idx, dtype=torch.long, device=device)
-            return None
-        return prepared.dihedral_param_index.to(device=device)
+    def get_dihedral_index_tensor(prepared: PreparedEntry) -> Optional["torch.Tensor"]:
+        """从 dihedral_param_index 映射到 dihedral_param 的行。"""
+
+        if prepared.dihedral_param_index is not None:
+            return prepared.dihedral_param_index.to(device=device)
+
+        if prepared.topology.rb_dihedrals:
+            idx = [
+                dihedral_lookup.get(getattr(d, "source_entry_idx", -1), -1)
+                for d in prepared.topology.rb_dihedrals
+            ]
+            return torch.as_tensor(idx, dtype=torch.long, device=device)
+        return None
 
     for iteration in range(1, int(args.max_iter) + 1):
         optimizer.zero_grad()
@@ -1626,10 +1658,10 @@ def run_torch_force_optimizer(
                 if prepared.coords_gpu is not None
                 else torch.as_tensor(entry.coords, dtype=dtype, device=device)
             )
-            sigma_atoms, epsilon_atoms = assemble_atom_params(
-                prepared.topology, sigma_clamped, epsilon_clamped
+            sigma_atoms, epsilon_atoms = build_lj_params_for_entry(
+                prepared, sigma_clamped, epsilon_clamped
             )
-            dih_idx = dihedral_index_tensor(prepared)
+            dih_idx = get_dihedral_index_tensor(prepared)
             forces_lj = compute_nonbonded_forces(
                 prepared.topology,
                 coords_t,
