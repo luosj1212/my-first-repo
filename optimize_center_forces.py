@@ -93,6 +93,7 @@ class PreparedEntry:
     dihedral_force_gpu: Optional[Any] = None
     temperature_factor_gpu: Optional[Any] = None
     dihedral_param_index: Optional[Any] = None
+    center_dihedral_indices: Optional[List[int]] = None
 
 
 @dataclass
@@ -513,6 +514,7 @@ def prepare_entries_for_prediction(
         dihedral_force_gpu = None
         temp_factor_gpu = None
         dihedral_param_tensor = None
+        center_dihedral_indices: Optional[List[int]] = None
         if use_gpu:
             coords_gpu = torch.as_tensor(entry.coords, dtype=torch.float32, device=gpu_device)
             atom_param_idx = np.full(len(top.atoms), -1, dtype=np.int64)
@@ -537,6 +539,11 @@ def prepare_entries_for_prediction(
             dihedral_force_gpu = torch.as_tensor(entry.dihedral_force_kj, dtype=torch.float32, device=gpu_device)
             temp_factor_gpu = torch.tensor(factor, dtype=torch.float32, device=gpu_device)
             if top.rb_dihedrals:
+                center_dihedral_indices = [
+                    dih_idx
+                    for dih_idx, dih in enumerate(top.rb_dihedrals)
+                    if (entry.center_index in {dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1})
+                ]
                 dih_param_idx = np.full(len(top.rb_dihedrals), -1, dtype=np.int64)
                 for dih_idx, dih in enumerate(top.rb_dihedrals):
                     src = getattr(dih, "source_entry_idx", None)
@@ -548,6 +555,13 @@ def prepare_entries_for_prediction(
                 dihedral_param_tensor = torch.as_tensor(
                     dih_param_idx, dtype=torch.long, device=gpu_device
                 )
+        else:
+            if top.rb_dihedrals:
+                center_dihedral_indices = [
+                    dih_idx
+                    for dih_idx, dih in enumerate(top.rb_dihedrals)
+                    if (entry.center_index in {dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1})
+                ]
         prepared.append(
             PreparedEntry(
                 entry=entry,
@@ -563,6 +577,7 @@ def prepare_entries_for_prediction(
                 dihedral_force_gpu=dihedral_force_gpu,
                 temperature_factor_gpu=temp_factor_gpu,
                 dihedral_param_index=dihedral_param_tensor,
+                center_dihedral_indices=center_dihedral_indices,
             )
         )
     return prepared
@@ -998,15 +1013,33 @@ def _compute_nonbonded_forces_gpu(
 def compute_dihedral_forces(
     top: Topology,
     coords_in,
+    *,
+    center_only_dihedrals: bool = False,
+    center_index: Optional[int] = None,
+    center_dihedral_indices: Optional[Sequence[int]] = None,
 ) -> np.ndarray:
     """
-    只计算 RB dihedral 的力，单位 kJ/mol/nm。
+    Compute RB dihedral forces in kJ/mol/nm.
+
+    When ``center_only_dihedrals`` is True, only dihedrals touching ``center_index``
+    are evaluated and the accumulated force on the centre atom is returned as a
+    length-3 vector. Otherwise, the full (N, 3) force array is produced.
     """
     coords = np.asarray(coords_in, dtype=float)
     n = coords.shape[0]
-    forces = np.zeros((n, 3), dtype=float)
+    if center_only_dihedrals:
+        if center_index is None:
+            raise ValueError("center_index must be provided when center_only_dihedrals is True")
+        forces_center = np.zeros(3, dtype=float)
+        dih_indices: Iterable[int] = (
+            center_dihedral_indices if center_dihedral_indices is not None else range(len(top.rb_dihedrals))
+        )
+    else:
+        forces = np.zeros((n, 3), dtype=float)
+        dih_indices = range(len(top.rb_dihedrals))
 
-    for dih in top.rb_dihedrals:
+    for dih_idx in dih_indices:
+        dih = top.rb_dihedrals[dih_idx]
         i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
 
         b1 = coords[i] - coords[j]
@@ -1024,7 +1057,6 @@ def compute_dihedral_forces(
         y = nb2 * float(np.dot(b1, c1))
         phi = math.atan2(y, x)
 
-        # RB 势 dV/dphi
         c = dih.c
         cosp = math.cos(phi)
         sinp = math.sin(phi)
@@ -1050,7 +1082,6 @@ def compute_dihedral_forces(
         Fk = -dVdphi * dphi_dk
         Fl = -dVdphi * dphi_dl
 
-        # 扭矩修正（保持和原脚本一致的写法）
         m = 0.5 * (coords[j] + coords[k])
         ri, rj, rk, rl = coords[i] - m, coords[j] - m, coords[k] - m, coords[l] - m
         tau = np.cross(ri, Fi) + np.cross(rj, Fj) + np.cross(rk, Fk) + np.cross(rl, Fl)
@@ -1061,12 +1092,22 @@ def compute_dihedral_forces(
         Fj = Fj + Delta
         Fk = Fk - Delta
 
-        forces[i] += Fi
-        forces[j] += Fj
-        forces[k] += Fk
-        forces[l] += Fl
+        if center_only_dihedrals:
+            if center_index == i:
+                forces_center += Fi
+            elif center_index == j:
+                forces_center += Fj
+            elif center_index == k:
+                forces_center += Fk
+            elif center_index == l:
+                forces_center += Fl
+        else:
+            forces[i] += Fi
+            forces[j] += Fj
+            forces[k] += Fk
+            forces[l] += Fl
 
-    return forces
+    return forces_center if center_only_dihedrals else forces
 
 
 def compute_dihedral_forces_torch(
@@ -1074,6 +1115,10 @@ def compute_dihedral_forces_torch(
     coords: "torch.Tensor",
     dihedral_params: Optional["torch.Tensor"] = None,
     dihedral_param_index: Optional["torch.Tensor"] = None,
+    *,
+    center_only_dihedrals: bool = False,
+    center_index: Optional[int] = None,
+    center_dihedral_indices: Optional[Sequence[int]] = None,
 ) -> "torch.Tensor":
     if torch is None:
         raise RuntimeError("Torch is required for dihedral force evaluation")
@@ -1081,9 +1126,19 @@ def compute_dihedral_forces_torch(
     device = coords.device
     dtype = coords.dtype
     n = coords.shape[0]
-    forces = torch.zeros((n, 3), dtype=dtype, device=device)
+    if center_only_dihedrals:
+        if center_index is None:
+            raise ValueError("center_index must be provided when center_only_dihedrals is True")
+        forces_center = torch.zeros((3,), dtype=dtype, device=device)
+        dih_indices: Iterable[int] = (
+            center_dihedral_indices if center_dihedral_indices is not None else range(len(top.rb_dihedrals))
+        )
+    else:
+        forces = torch.zeros((n, 3), dtype=dtype, device=device)
+        dih_indices = range(len(top.rb_dihedrals))
 
-    for dih_idx, dih in enumerate(top.rb_dihedrals):
+    for dih_idx in dih_indices:
+        dih = top.rb_dihedrals[dih_idx]
         i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
 
         b1 = coords[i] - coords[j]
@@ -1152,12 +1207,96 @@ def compute_dihedral_forces_torch(
         Fj = Fj + Delta
         Fk = Fk - Delta
 
-        forces[i] += Fi
-        forces[j] += Fj
-        forces[k] += Fk
-        forces[l] += Fl
+        if center_only_dihedrals:
+            if center_index == i:
+                forces_center = forces_center + Fi
+            elif center_index == j:
+                forces_center = forces_center + Fj
+            elif center_index == k:
+                forces_center = forces_center + Fk
+            elif center_index == l:
+                forces_center = forces_center + Fl
+        else:
+            forces[i] += Fi
+            forces[j] += Fj
+            forces[k] += Fk
+            forces[l] += Fl
 
-    return forces
+    return forces_center if center_only_dihedrals else forces
+
+
+def debug_compare_full_vs_center_only_dihedrals(
+    prepared_entries: Sequence[PreparedEntry],
+    dihedral_params: Optional[NDArray[np.float32]] = None,
+    device: str = "cpu",
+    max_entries: int = 10,
+    tolerance: float = 1e-6,
+) -> float:
+    """
+    Compare centre-atom dihedral forces between full and centre-only paths.
+
+    Returns the maximum absolute difference and asserts it is within ``tolerance``.
+    """
+    if torch is None:
+        raise RuntimeError("Torch is required for dihedral comparison debug helper")
+
+    want_gpu = device.lower() == "gpu"
+    if want_gpu and not torch.cuda.is_available():
+        print("[debug] CUDA unavailable; falling back to CPU for comparison")
+    torch_device = torch.device("cuda" if want_gpu and torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    param_tensor = (
+        None
+        if dihedral_params is None
+        else torch.as_tensor(dihedral_params, dtype=dtype, device=torch_device)
+    )
+
+    max_diff = 0.0
+    checked = 0
+    for prepared in prepared_entries:
+        if max_entries is not None and checked >= max_entries:
+            break
+        entry = prepared.entry
+        coords_t = (
+            prepared.coords_gpu.to(device=torch_device)
+            if prepared.coords_gpu is not None
+            else torch.as_tensor(entry.coords, dtype=dtype, device=torch_device)
+        )
+        dihedral_idx = (
+            prepared.dihedral_param_index.to(device=torch_device)
+            if prepared.dihedral_param_index is not None
+            else None
+        )
+
+        full_force = compute_dihedral_forces_torch(
+            prepared.topology,
+            coords_t,
+            dihedral_params=param_tensor,
+            dihedral_param_index=dihedral_idx,
+            center_only_dihedrals=False,
+        )
+        center_full = full_force[entry.center_index].detach().cpu().numpy()
+
+        center_only_force = compute_dihedral_forces_torch(
+            prepared.topology,
+            coords_t,
+            dihedral_params=param_tensor,
+            dihedral_param_index=dihedral_idx,
+            center_only_dihedrals=True,
+            center_index=entry.center_index,
+            center_dihedral_indices=prepared.center_dihedral_indices,
+        )
+        center_only = center_only_force.detach().cpu().numpy()
+
+        diff = float(np.max(np.abs(center_full - center_only)))
+        max_diff = max(max_diff, diff)
+        checked += 1
+
+    print(f"[debug] max |ΔF_center| = {max_diff:.3e} over {checked} entries")
+    assert max_diff <= tolerance, (
+        f"centre-only dihedral forces differ from full forces by {max_diff:.3e} (> {tolerance})"
+    )
+    return max_diff
 
 
 def predict_forces(
@@ -1166,6 +1305,7 @@ def predict_forces(
     rvdw: float,
     device: str = "gpu",
     recompute_dihedral: bool = False,
+    center_only_dihedrals: bool = False,
 ) -> NDArray[np.float32]:
     """
     用和 compare_plot_csv.py 一致的方式计算预测力。
@@ -1201,11 +1341,27 @@ def predict_forces(
         idx = entry.center_index
         if recompute_dihedral:
             if use_gpu and prepared.coords_gpu is not None and torch is not None:
-                dih_force_t = compute_dihedral_forces_torch(prepared.topology, prepared.coords_gpu)
+                dih_force_t = compute_dihedral_forces_torch(
+                    prepared.topology,
+                    prepared.coords_gpu,
+                    center_only_dihedrals=center_only_dihedrals,
+                    center_index=idx,
+                    center_dihedral_indices=prepared.center_dihedral_indices,
+                )
                 dihedral_force_full = dih_force_t.detach().cpu().numpy()
             else:
-                dihedral_force_full = compute_dihedral_forces(prepared.topology, entry.coords)
-            dihedral_center = dihedral_force_full[idx]
+                dihedral_force_full = compute_dihedral_forces(
+                    prepared.topology,
+                    entry.coords,
+                    center_only_dihedrals=center_only_dihedrals,
+                    center_index=idx,
+                    center_dihedral_indices=prepared.center_dihedral_indices,
+                )
+            dihedral_center = (
+                dihedral_force_full
+                if center_only_dihedrals
+                else dihedral_force_full[idx]
+            )
 
         else:
             dihedral_center = (
@@ -1385,6 +1541,8 @@ def run_torch_force_optimizer(
     targets: NDArray[np.float32],
     args: argparse.Namespace,
     logger: OptimisationLogger,
+    *,
+    center_only_dihedrals: bool = True,
 ) -> Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32], Dict[str, object]]:
     if torch is None:
         raise RuntimeError("Torch is required for GPU force optimisation")
@@ -1489,6 +1647,9 @@ def run_torch_force_optimizer(
                 coords_t,
                 dihedral_params=dihedral_clamped,
                 dihedral_param_index=dih_idx,
+                center_only_dihedrals=center_only_dihedrals,
+                center_index=entry.center_index,
+                center_dihedral_indices=prepared.center_dihedral_indices,
             )
 
             coulomb = (
@@ -1507,7 +1668,12 @@ def run_torch_force_optimizer(
                 else torch.as_tensor(entry.angle_force_kj, dtype=dtype, device=device)
             )
 
-            total_nb = forces_lj[entry.center_index] + coulomb + dihedral_force[entry.center_index]
+            dihedral_center = (
+                dihedral_force
+                if center_only_dihedrals
+                else dihedral_force[entry.center_index]
+            )
+            total_nb = forces_lj[entry.center_index] + coulomb + dihedral_center
             total = total_nb + bond + angle
             temp_factor = (
                 prepared.temperature_factor_gpu.to(device=device)
@@ -1740,6 +1906,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-2, help="Learning rate for the GPU optimiser")
     parser.add_argument("--patience", type=int, default=1000, help="Early stopping patience for both optimisers")
     parser.add_argument("--log-interval", type=int, default=100, help="Iterations between optimisation log entries")
+    parser.add_argument(
+        "--test-center-only-dihedrals",
+        action="store_true",
+        help="Debug: compare full vs centre-only dihedral forces and exit",
+    )
     # === 新增：退火相关参数 ===
     parser.add_argument(
         "--anneal-init",
@@ -1828,6 +1999,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dihedral_targets=dihedral_targets,
     )
     refresh_prepared_topologies(prepared_entries, summary)
+
+    if args.test_center_only_dihedrals:
+        dihedral_param_tensor: Optional[NDArray[np.float32]] = None
+        if dihedral_targets:
+            dihedral_param_tensor = np.asarray(dihedral0, dtype=np.float32)
+        debug_compare_full_vs_center_only_dihedrals(
+            prepared_entries,
+            dihedral_params=dihedral_param_tensor,
+            device=args.device,
+        )
+        print("[debug] centre-only dihedral forces match full forces; exiting after test")
+        return 0
     linear_system, sigma_all_summary, epsilon_all_summary = build_linearized_lj_system(
         prepared_entries, summary, args.rvdw
     )
@@ -1841,6 +2024,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rvdw=args.rvdw,
         device=args.device,
         recompute_dihedral=bool(dihedral_targets),
+        center_only_dihedrals=bool(dihedral_targets),
     )
     initial_metrics = compute_metrics(initial_pred, targets)
     logger.log("initial", initial_metrics, logger.snapshot_params(sigma0, epsilon0, dihedral0))
@@ -1922,6 +2106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 rvdw=args.rvdw,
                 device=args.device,
                 recompute_dihedral=bool(dihedral_targets),
+                center_only_dihedrals=bool(dihedral_targets),
             )
             metrics = compute_metrics(pred, targets)
             logger.eval_counter += 1
@@ -1979,6 +2164,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rvdw=args.rvdw,
         device=args.device,
         recompute_dihedral=bool(dihedral_targets),
+        center_only_dihedrals=bool(dihedral_targets),
     )
     final_metrics = compute_metrics(final_pred, targets)
     logger.log(
