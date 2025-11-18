@@ -1126,103 +1126,154 @@ def compute_dihedral_forces_torch(
     device = coords.device
     dtype = coords.dtype
     n = coords.shape[0]
+    n_dih = len(top.rb_dihedrals)
+
+    if center_only_dihedrals and center_index is None:
+        raise ValueError("center_index must be provided when center_only_dihedrals is True")
+
+    # Build a tensor of shape [n_dih, 4] holding (i, j, k, l) indices (zero-based).
+    ijkl = torch.tensor(
+        [[dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1] for dih in top.rb_dihedrals],
+        dtype=torch.long,
+        device=device,
+    )
+
+    # Select which dihedrals to evaluate. For centre-only mode we only keep the relevant subset
+    # (matching the previous Python loop over ``center_dihedral_indices`` when provided).
     if center_only_dihedrals:
-        if center_index is None:
-            raise ValueError("center_index must be provided when center_only_dihedrals is True")
-        forces_center = torch.zeros((3,), dtype=dtype, device=device)
-        dih_indices: Iterable[int] = (
-            center_dihedral_indices if center_dihedral_indices is not None else range(len(top.rb_dihedrals))
-        )
+        if center_dihedral_indices is not None:
+            dih_indices_t = torch.as_tensor(center_dihedral_indices, dtype=torch.long, device=device)
+        else:
+            dih_indices_t = torch.arange(n_dih, device=device)
     else:
-        forces = torch.zeros((n, 3), dtype=dtype, device=device)
-        dih_indices = range(len(top.rb_dihedrals))
+        dih_indices_t = torch.arange(n_dih, device=device)
 
-    for dih_idx in dih_indices:
-        dih = top.rb_dihedrals[dih_idx]
-        i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
+    ijkl = ijkl.index_select(0, dih_indices_t)
+    idx_i, idx_j, idx_k, idx_l = [ijkl[:, col] for col in range(4)]
 
-        b1 = coords[i] - coords[j]
-        b2 = coords[k] - coords[j]
-        b3 = coords[l] - coords[k]
+    # Base RB coefficients from the topology, shape [n_dih, 6]. These are later overridden by
+    # ``dihedral_params`` wherever a valid ``dihedral_param_index`` is provided.
+    coeffs_base = torch.tensor(
+        [dih.c for dih in top.rb_dihedrals], dtype=dtype, device=device
+    ).index_select(0, dih_indices_t)
 
-        c1 = torch.cross(b2, b3, dim=-1)
-        c2 = torch.cross(b1, b2, dim=-1)
+    if dihedral_params is not None and dihedral_param_index is not None:
+        param_idx_full = torch.full((n_dih,), -1, dtype=torch.long, device=device)
+        max_fill = min(len(dihedral_param_index), n_dih)
+        param_idx_full[:max_fill] = dihedral_param_index[:max_fill].to(device=device, dtype=torch.long)
+        param_idx = param_idx_full.index_select(0, dih_indices_t)
 
-        nb2 = torch.clamp(torch.linalg.norm(b2), min=1e-12)
-        nc1 = torch.clamp(torch.linalg.norm(c1), min=1e-12)
-        nc2 = torch.clamp(torch.linalg.norm(c2), min=1e-12)
+        # Clone to avoid mutating the base coefficients when applying overrides.
+        coeffs = coeffs_base.clone()
+        valid_mask = param_idx >= 0
+        if valid_mask.any():
+            coeffs[valid_mask] = dihedral_params[param_idx[valid_mask]]
+    else:
+        coeffs = coeffs_base
 
-        x = torch.dot(c2, c1)
-        y = nb2 * torch.dot(b1, c1)
-        phi = torch.atan2(y, x)
+    # Gather coordinates for each (i, j, k, l) and build the bond vectors in batch.
+    coords_i = coords.index_select(0, idx_i)
+    coords_j = coords.index_select(0, idx_j)
+    coords_k = coords.index_select(0, idx_k)
+    coords_l = coords.index_select(0, idx_l)
 
-        if dihedral_params is not None and dihedral_param_index is not None:
-            param_idx = int(dihedral_param_index[dih_idx]) if dih_idx < len(dihedral_param_index) else -1
-        else:
-            param_idx = -1
-        if param_idx >= 0 and dihedral_params is not None:
-            coeffs = dihedral_params[param_idx]
-        else:
-            coeffs = torch.tensor(dih.c, dtype=dtype, device=device)
+    b1 = coords_i - coords_j
+    b2 = coords_k - coords_j
+    b3 = coords_l - coords_k
 
-        cosp = torch.cos(phi)
-        sinp = torch.sin(phi)
-        s = torch.zeros((), dtype=dtype, device=device)
-        cp = torch.ones((), dtype=dtype, device=device)
-        for n_ in range(1, 6):
-            s = s + n_ * coeffs[n_] * cp
-            cp = cp * cosp
-        dVdphi = -sinp * s
+    # Cross products (c1 = b2 x b3, c2 = b1 x b2) and their norms.
+    c1 = torch.cross(b2, b3, dim=-1)
+    c2 = torch.cross(b1, b2, dim=-1)
 
-        dphi_di = (nb2 / (nc2 * nc2)) * c2
-        dphi_dl = (nb2 / (nc1 * nc1)) * c1
+    nb2 = torch.clamp(torch.linalg.norm(b2, dim=-1, keepdim=True), min=1e-12)
+    nc1 = torch.clamp(torch.linalg.norm(c1, dim=-1, keepdim=True), min=1e-12)
+    nc2 = torch.clamp(torch.linalg.norm(c2, dim=-1, keepdim=True), min=1e-12)
 
-        db1b2 = torch.dot(b1, b2)
-        db3b2 = torch.dot(b3, b2)
-        term_j1 = (db1b2 / nb2) / (nc2 * nc2)
-        term_j2 = torch.dot(b1, c2) / (nc2 * nc2)
-        term_l1 = (db3b2 / nb2) / (nc1 * nc1)
-        term_l2 = torch.dot(b3, c1) / (nc1 * nc1)
+    # GROMACS-style φ calculation: x = c2·c1, y = |b2| (b1·c1).
+    x = (c2 * c1).sum(dim=-1)
+    y = (nb2.squeeze(-1)) * (b1 * c1).sum(dim=-1)
+    phi = torch.atan2(y, x)
 
-        dphi_dj = term_j1 * c2 - term_j2 * torch.cross(b1, b2) / nb2
-        dphi_dk = term_l1 * c1 + term_l2 * torch.cross(b3, b2) / nb2
-        dphi_dk = -(dphi_di + dphi_dj + dphi_dk)
+    cosp = torch.cos(phi)
+    sinp = torch.sin(phi)
 
-        Fi = -dVdphi * dphi_di
-        Fj = -dVdphi * dphi_dj
-        Fk = -dVdphi * dphi_dk
-        Fl = -dVdphi * dphi_dl
+    # Vectorised equivalent of the per-dihedral loop accumulating s = Σ n c_n cos^{n-1}(φ).
+    s = torch.zeros_like(phi)
+    cp = torch.ones_like(phi)
+    for n_ in range(1, 6):
+        s = s + n_ * coeffs[:, n_] * cp
+        cp = cp * cosp
+    dVdphi = -sinp * s
 
-        m = 0.5 * (coords[j] + coords[k])
-        ri, rj, rk, rl = coords[i] - m, coords[j] - m, coords[k] - m, coords[l] - m
-        tau = (torch.cross(ri, Fi, dim=-1)
-            + torch.cross(rj, Fj, dim=-1)
-            + torch.cross(rk, Fk, dim=-1)
-            + torch.cross(rl, Fl, dim=-1))
-        cross_bt = torch.cross(b2, tau, dim=-1)
+    # dφ/di and dφ/dl terms share the same scalar prefactors as the NumPy/Torch scalar version.
+    dphi_di = (nb2 / (nc2 * nc2)) * c2
+    dphi_dl = (nb2 / (nc1 * nc1)) * c1
 
-        denom = torch.dot(b2, b2) + 1e-30
-        Delta = -cross_bt / denom
+    db1b2 = (b1 * b2).sum(dim=-1, keepdim=True)
+    db3b2 = (b3 * b2).sum(dim=-1, keepdim=True)
+    term_j1 = (db1b2 / nb2) / (nc2 * nc2)
+    term_j2 = ((b1 * c2).sum(dim=-1, keepdim=True)) / (nc2 * nc2)
+    term_l1 = (db3b2 / nb2) / (nc1 * nc1)
+    term_l2 = ((b3 * c1).sum(dim=-1, keepdim=True)) / (nc1 * nc1)
 
-        Fj = Fj + Delta
-        Fk = Fk - Delta
+    cross_b1b2 = torch.cross(b1, b2, dim=-1)
+    cross_b3b2 = torch.cross(b3, b2, dim=-1)
 
-        if center_only_dihedrals:
-            if center_index == i:
-                forces_center = forces_center + Fi
-            elif center_index == j:
-                forces_center = forces_center + Fj
-            elif center_index == k:
-                forces_center = forces_center + Fk
-            elif center_index == l:
-                forces_center = forces_center + Fl
-        else:
-            forces[i] += Fi
-            forces[j] += Fj
-            forces[k] += Fk
-            forces[l] += Fl
+    dphi_dj = term_j1 * c2 - term_j2 * cross_b1b2 / nb2
+    dphi_dk = term_l1 * c1 + term_l2 * cross_b3b2 / nb2
+    dphi_dk = -(dphi_di + dphi_dj + dphi_dk)
 
-    return forces_center if center_only_dihedrals else forces
+    Fi = -(dVdphi.unsqueeze(-1)) * dphi_di
+    Fj = -(dVdphi.unsqueeze(-1)) * dphi_dj
+    Fk = -(dVdphi.unsqueeze(-1)) * dphi_dk
+    Fl = -(dVdphi.unsqueeze(-1)) * dphi_dl
+
+    # Torque correction (Delta) applied to Fj/Fk is batched by operating on all dihedrals at once.
+    m = 0.5 * (coords_j + coords_k)
+    ri, rj, rk, rl = coords_i - m, coords_j - m, coords_k - m, coords_l - m
+    tau = (
+        torch.cross(ri, Fi, dim=-1)
+        + torch.cross(rj, Fj, dim=-1)
+        + torch.cross(rk, Fk, dim=-1)
+        + torch.cross(rl, Fl, dim=-1)
+    )
+    cross_bt = torch.cross(b2, tau, dim=-1)
+
+    denom = (b2 * b2).sum(dim=-1, keepdim=True) + 1e-30
+    Delta = -cross_bt / denom
+
+    Fj = Fj + Delta
+    Fk = Fk - Delta
+
+    if center_only_dihedrals:
+        # Accumulate only the centre atom contribution without materialising the full force array.
+        forces_center = torch.zeros((3,), dtype=dtype, device=device)
+
+        mask_i = idx_i == center_index
+        mask_j = idx_j == center_index
+        mask_k = idx_k == center_index
+        mask_l = idx_l == center_index
+
+        if mask_i.any():
+            forces_center = forces_center + Fi[mask_i].sum(dim=0)
+        if mask_j.any():
+            forces_center = forces_center + Fj[mask_j].sum(dim=0)
+        if mask_k.any():
+            forces_center = forces_center + Fk[mask_k].sum(dim=0)
+        if mask_l.any():
+            forces_center = forces_center + Fl[mask_l].sum(dim=0)
+
+        # Optional helper for debugging parity with the full-force path can be added here if needed.
+        return forces_center
+
+    # Full-force accumulation: scatter the [n_dih, 3] forces back to the [n_atoms, 3] tensor.
+    forces = torch.zeros((n, 3), dtype=dtype, device=device)
+    forces.index_add_(0, idx_i, Fi)
+    forces.index_add_(0, idx_j, Fj)
+    forces.index_add_(0, idx_k, Fk)
+    forces.index_add_(0, idx_l, Fl)
+
+    return forces
 
 
 def debug_compare_full_vs_center_only_dihedrals(
