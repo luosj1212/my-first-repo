@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
@@ -37,6 +38,7 @@ from compare_forces import (
     build_exclusions,
     infer_topology_from_summary,
 )
+import torch.autograd
 
 R_KJ_PER_MOL_K = 0.00831446261815324  # Boltzmann constant in kJ mol^-1 K^-1
 DEFAULT_BOX = np.array([1e6, 1e6, 1e6], dtype=float)
@@ -957,19 +959,37 @@ def _compute_nonbonded_forces_gpu(
 
     diff = coords[None, :, :] - coords[:, None, :]
 # 现在 diff[i, j] = coords[j] - coords[i]，和 CPU / compare_forces 一致
+    # 物理上 r 不会小到 0.01 nm 以下，这里人为加个更“温和”的下限
+    MIN_R2 = 1e-6  # (0.01 nm)^2，可按需要调，比如 1e-3 (0.0316 nm)^2
 
     r2 = torch.sum(diff * diff, dim=-1)
     triu_mask = torch.triu(torch.ones((n, n), dtype=torch.bool, device=device), diagonal=1)
-    valid_mask = triu_mask & (r2 >= 1e-24)
+    valid_mask = triu_mask & (r2 >= MIN_R2)
 
     if do_lj and rvdw > 0:
         dist = torch.sqrt(torch.clamp(r2, min=1e-24))
         mask = valid_mask & (~exclusion_mask) & (dist < rvdw)
         if torch.any(mask):
-            sig = torch.sqrt(sigma[:, None] * sigma[None, :])
-            eps = torch.sqrt(epsilon[:, None] * epsilon[None, :])
-            c6 = 4.0 * eps * (sig ** 6)
-            c12 = 4.0 * eps * (sig ** 12)
+            # --- 避免 sqrt(0) 的安全混合 ---
+            sigma_mat = sigma[:, None] * sigma[None, :]
+            epsilon_mat = epsilon[:, None] * epsilon[None, :]
+
+            # 对 σ、ε 的乘积分别建“非零掩码”
+            nonzero_sigma = sigma_mat > 0
+            nonzero_epsilon = epsilon_mat > 0
+
+            sig_mix = torch.zeros_like(sigma_mat)
+            eps_mix = torch.zeros_like(epsilon_mat)
+
+            # 只有在乘积>0 的地方才做 sqrt，其他地方保持 0
+            sig_mix[nonzero_sigma] = torch.sqrt(sigma_mat[nonzero_sigma])
+            eps_mix[nonzero_epsilon] = torch.sqrt(epsilon_mat[nonzero_epsilon])
+
+            # 和 compare_forces 的 C6/C12 形式保持一致
+            c6 = 4.0 * eps_mix * (sig_mix ** 6)
+            c12 = 4.0 * eps_mix * (sig_mix ** 12)
+
+            # 1-4 的 fudge
             c6 = torch.where(pair14_mask, c6 * top.fudgeLJ, c6)
             c12 = torch.where(pair14_mask, c12 * top.fudgeLJ, c12)
 
@@ -987,6 +1007,7 @@ def _compute_nonbonded_forces_gpu(
             pairs = torch.nonzero(mask, as_tuple=False)
             forces.index_add_(0, pairs[:, 0], pair_forces)
             forces.index_add_(0, pairs[:, 1], -pair_forces)
+
 
     if do_coul and rcoul > 0:
         dist = torch.sqrt(torch.clamp(r2, min=1e-24))
@@ -1507,8 +1528,8 @@ def run_linearized_torch_optimizer(
             print(f"[ERROR] Non-finite loss encountered at iteration {iteration}")
             break
 
-        loss_tensor.backward()
-
+        with torch.autograd.detect_anomaly():
+            loss_tensor.backward()
         for name, param in (("sigma", sigma_param), ("epsilon", epsilon_param)):
             if param.grad is not None and not torch.isfinite(param.grad).all():
                 print(f"[ERROR] Non-finite gradient for {name} at iteration {iteration}")
@@ -1608,6 +1629,11 @@ def run_torch_force_optimizer(
         slot.summary_index: idx for idx, slot in enumerate(dihedral_targets)
     }
     target_t = torch.as_tensor(targets, dtype=dtype, device=device)
+    batch_size_arg = getattr(args, "batch_size", None)
+    batch_size = max(
+        int(len(prepared_entries) if batch_size_arg is None else batch_size_arg), 1
+    )
+    profile_step = bool(getattr(args, "profile_step", False))
 
     sigma_param = torch.nn.Parameter(torch.as_tensor(sigma0, dtype=dtype, device=device))
     epsilon_param = torch.nn.Parameter(torch.as_tensor(epsilon0, dtype=dtype, device=device))
@@ -1686,8 +1712,16 @@ def run_torch_force_optimizer(
             return torch.as_tensor(idx, dtype=torch.long, device=device)
         return None
 
+    def sync_device() -> None:
+        if profile_step and device.type == "cuda":
+            torch.cuda.synchronize()
+
     for iteration in range(1, int(args.max_iter) + 1):
         optimizer.zero_grad()
+
+        build_params_time = 0.0
+        forces_lj_time = 0.0
+        forces_dih_time = 0.0
 
         sigma_clamped = torch.clamp(
             sigma_param, min=float(args.sigma_min), max=float(args.sigma_max)
@@ -1702,81 +1736,300 @@ def run_torch_force_optimizer(
         )
 
         preds: List["torch.Tensor"] = []
-        for prepared in prepared_entries:
-            entry = prepared.entry
-            coords_t = (
-                prepared.coords_gpu.to(device=device)
-                if prepared.coords_gpu is not None
-                else torch.as_tensor(entry.coords, dtype=dtype, device=device)
-            )
-            sigma_atoms, epsilon_atoms = build_lj_params_for_entry(
-                prepared, sigma_clamped, epsilon_clamped
-            )
-            dih_idx = get_dihedral_index_tensor(prepared)
-            forces_lj = compute_nonbonded_forces(
-                prepared.topology,
-                coords_t,
-                rcoul=0.0,
-                rvdw=args.rvdw,
-                do_lj=True,
-                do_coul=False,
-                device="gpu" if want_gpu else "cpu",
-                sigma_override=sigma_atoms,
-                epsilon_override=epsilon_atoms,
-                return_numpy=False,
-            )
-            dihedral_force = compute_dihedral_forces_torch(
-                prepared.topology,
-                coords_t,
-                dihedral_params=dihedral_clamped,
-                dihedral_param_index=dih_idx,
-                center_only_dihedrals=center_only_dihedrals,
-                center_index=entry.center_index,
-                center_dihedral_indices=prepared.center_dihedral_indices,
-            )
+        for batch_start in range(0, len(prepared_entries), batch_size):
+            batch = prepared_entries[batch_start : batch_start + batch_size]
 
-            coulomb = (
-                prepared.coulomb_force_gpu.to(device=device)
-                if prepared.coulomb_force_gpu is not None
-                else torch.as_tensor(entry.coulomb_force_kj, dtype=dtype, device=device)
-            )
-            bond = (
-                prepared.bond_force_gpu.to(device=device)
-                if prepared.bond_force_gpu is not None
-                else torch.as_tensor(entry.bond_force_kj, dtype=dtype, device=device)
-            )
-            angle = (
-                prepared.angle_force_gpu.to(device=device)
-                if prepared.angle_force_gpu is not None
-                else torch.as_tensor(entry.angle_force_kj, dtype=dtype, device=device)
-            )
+            batch_cache: List[Dict[str, Any]] = []
 
-            dihedral_center = (
-                dihedral_force
-                if center_only_dihedrals
-                else dihedral_force[entry.center_index]
-            )
-            total_nb = forces_lj[entry.center_index] + coulomb + dihedral_center
-            total = total_nb + bond + angle
-            temp_factor = (
-                prepared.temperature_factor_gpu.to(device=device)
-                if prepared.temperature_factor_gpu is not None
-                else torch.tensor(prepared.temperature_factor, dtype=dtype, device=device)
-            )
-            preds.append(total * temp_factor)
+            # Profile: build per-atom parameters and dihedral indices
+            sync_device()
+            build_start = time.perf_counter()
+            for prepared in batch:
+                entry = prepared.entry
+                coords_t = (
+                    prepared.coords_gpu.to(device=device)
+                    if prepared.coords_gpu is not None
+                    else torch.as_tensor(entry.coords, dtype=dtype, device=device)
+                )
+                sigma_atoms, epsilon_atoms = build_lj_params_for_entry(
+                    prepared, sigma_clamped, epsilon_clamped
+                )
+                dih_idx = get_dihedral_index_tensor(prepared)
 
+                coulomb = (
+                    prepared.coulomb_force_gpu.to(device=device)
+                    if prepared.coulomb_force_gpu is not None
+                    else torch.as_tensor(entry.coulomb_force_kj, dtype=dtype, device=device)
+                )
+                bond = (
+                    prepared.bond_force_gpu.to(device=device)
+                    if prepared.bond_force_gpu is not None
+                    else torch.as_tensor(entry.bond_force_kj, dtype=dtype, device=device)
+                )
+                angle = (
+                    prepared.angle_force_gpu.to(device=device)
+                    if prepared.angle_force_gpu is not None
+                    else torch.as_tensor(entry.angle_force_kj, dtype=dtype, device=device)
+                )
+                temp_factor = (
+                    prepared.temperature_factor_gpu.to(device=device)
+                    if prepared.temperature_factor_gpu is not None
+                    else torch.tensor(
+                        prepared.temperature_factor, dtype=dtype, device=device
+                    )
+                )
+
+                batch_cache.append(
+                    {
+                        "prepared": prepared,
+                        "entry": entry,
+                        "coords_t": coords_t,
+                        "sigma_atoms": sigma_atoms,
+                        "epsilon_atoms": epsilon_atoms,
+                        "dih_idx": dih_idx,
+                        "coulomb": coulomb,
+                        "bond": bond,
+                        "angle": angle,
+                        "temp_factor": temp_factor,
+                    }
+                )
+
+            sync_device()
+            build_params_time += time.perf_counter() - build_start
+
+            # Profile: LJ force calculations
+            sync_device()
+            lj_start = time.perf_counter()
+            for cached in batch_cache:
+                cached["forces_lj"] = compute_nonbonded_forces(
+                    cached["prepared"].topology,
+                    cached["coords_t"],
+                    rcoul=0.0,
+                    rvdw=args.rvdw,
+                    do_lj=True,
+                    do_coul=False,
+                    device="gpu" if want_gpu else "cpu",
+                    sigma_override=cached["sigma_atoms"],
+                    epsilon_override=cached["epsilon_atoms"],
+                    return_numpy=False,
+                )
+            sync_device()
+            forces_lj_time += time.perf_counter() - lj_start
+
+            # Profile: dihedral force calculations
+            sync_device()
+            dih_start = time.perf_counter()
+            for cached in batch_cache:
+                cached["dihedral_force"] = compute_dihedral_forces_torch(
+                    cached["prepared"].topology,
+                    cached["coords_t"],
+                    dihedral_params=dihedral_clamped,
+                    dihedral_param_index=cached["dih_idx"],
+                    center_only_dihedrals=center_only_dihedrals,
+                    center_index=cached["entry"].center_index,
+                    center_dihedral_indices=cached["prepared"].center_dihedral_indices,
+                )
+            sync_device()
+            forces_dih_time += time.perf_counter() - dih_start
+
+            for cached in batch_cache:
+                dihedral_center = (
+                    cached["dihedral_force"]
+                    if center_only_dihedrals
+                    else cached["dihedral_force"][cached["entry"].center_index]
+                )
+                total_nb = (
+                    cached["forces_lj"][cached["entry"].center_index]
+                    + cached["coulomb"]
+                    + dihedral_center
+                )
+                total = total_nb + cached["bond"] + cached["angle"]
+                preds.append(total * cached["temp_factor"])
         pred_t = torch.stack(preds, dim=0)
-        loss_tensor = torch.mean((pred_t - target_t) ** 2)
 
-        if not torch.isfinite(loss_tensor):
-            print(f"[ERROR] Non-finite loss encountered at iteration {iteration}")
+        # ---- Safety checks before backprop ----
+        # 1) 预测值必须是有限的
+        if not torch.isfinite(pred_t).all():
+            bad_mask = ~torch.isfinite(pred_t)
+            num_bad = int(bad_mask.sum().item())
+            print(f"[ERROR] Non-finite predictions at iteration {iteration} (count={num_bad}); aborting optimisation.")
+            finite_vals = pred_t[torch.isfinite(pred_t)]
+            if finite_vals.numel() > 0:
+                print(
+                    f"        finite pred_t min={float(finite_vals.min()):.6g}, "
+                    f"max={float(finite_vals.max()):.6g}"
+                )
             break
 
-        loss_tensor.backward()
+        loss_tensor = torch.mean((pred_t - target_t) ** 2)
+
+        # 2) loss 自己也必须是有限的
+        if not torch.isfinite(loss_tensor):
+            print(f"[ERROR] Non-finite loss encountered at iteration {iteration}; aborting optimisation step.")
+            # 打一点当前参数范围的信息，方便排查
+            with torch.no_grad():
+                sig_min = float(sigma_clamped.min())
+                sig_max = float(sigma_clamped.max())
+                eps_min = float(epsilon_clamped.min())
+                eps_max = float(epsilon_clamped.max())
+                dih_min = float(dihedral_clamped.min())
+                dih_max = float(dihedral_clamped.max())
+            print(
+                f"        sigma range = [{sig_min:.6g}, {sig_max:.6g}], "
+                f"epsilon range = [{eps_min:.6g}, {eps_max:.6g}], "
+                f"dihedral range = [{dih_min:.6g}, {dih_max:.6g}]"
+            )
+            break
+
+        # ==== backward 计时（修复 loss_backward_time 未定义）====
+        loss_backward_time = 0.0
+        if profile_step:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            with torch.autograd.detect_anomaly():
+                loss_tensor.backward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            loss_backward_time = time.perf_counter() - t0
+        else:
+            with torch.autograd.detect_anomaly():
+                loss_tensor.backward()
+        # =====================================================
+        # 3) 再检查一次梯度是不是有限的
+        bad_grad = False
+        for p_name, p in [
+            ("sigma_param", sigma_param),
+            ("epsilon_param", epsilon_param),
+            ("dihedral_param", dihedral_param),
+        ]:
+            if p.grad is None:
+                continue
+            if not torch.isfinite(p.grad).all():
+                g = p.grad
+                mask = ~torch.isfinite(g)
+                bad_idx = torch.nonzero(mask, as_tuple=False).view(-1)
+
+                print(f"[ERROR] Non-finite gradients for {p_name} at iteration {iteration}; aborting optimisation.")
+                print(f"        bad_indices (up to 10): {bad_idx[:10].tolist()}")
+
+                # 打一下有限梯度的范围，看是不是有极端大值
+                finite = g[torch.isfinite(g)]
+                if finite.numel() > 0:
+                    print(
+                        f"        {p_name}.grad finite min={float(finite.min()):.6g}, "
+                        f"max={float(finite.max()):.6g}"
+                    )
+
+                # 对 sigma/epsilon，打印对应 LJ 类型名 + 当前参数值
+                if p_name in ("sigma_param", "epsilon_param"):
+                    # 这里假设 run_torch_xxx 里有 lj_targets 这个列表可见
+                    for idx in bad_idx[:10].tolist():
+                        if 0 <= idx < len(lj_targets):
+                            slot = lj_targets[idx]
+                            val = (sigma_clamped if p_name == "sigma_param" else epsilon_clamped)[idx]
+                            grad_val = g[idx]
+                            print(
+                                f"        {p_name}[{idx}] ({slot.label}): "
+                                f"value={float(val.item()):.6g}, "
+                                f"grad={float(grad_val.item())}"
+                            )
+
+                # ====== 你之前加的 LJ / DIH 力输出可以接在这里 ======
+                try:
+                    with torch.no_grad():
+                        lj_list = []
+                        dih_list = []
+                        nb_list = []
+                        total_list = []
+
+                        for cached in batch_cache:
+                            center_idx = cached["entry"].center_index
+                            tf = cached["temp_factor"]
+
+                            lj_c = cached["forces_lj"][center_idx] * tf
+
+                            if center_only_dihedrals:
+                                dih_c = cached["dihedral_force"] * tf
+                            else:
+                                dih_c = cached["dihedral_force"][center_idx] * tf
+
+                            coul_c = cached["coulomb"] * tf
+                            bond_c = cached["bond"] * tf
+                            angle_c = cached["angle"] * tf
+
+                            nb_c = lj_c + coul_c + dih_c
+                            total_c = nb_c + bond_c + angle_c
+
+                            lj_list.append(lj_c.detach().cpu())
+                            dih_list.append(dih_c.detach().cpu())
+                            nb_list.append(nb_c.detach().cpu())
+                            total_list.append(total_c.detach().cpu())
+
+                        def _stats(name, xs):
+                            if not xs:
+                                return
+                            x = torch.stack(xs).view(-1)
+                            print(
+                                f"        [{name}] min={float(x.min()):.6g}, "
+                                f"max={float(x.max()):.6g}, "
+                                f"mean={float(x.mean()):.6g}"
+                            )
+
+                        print("        Debugging LJ / dihedral for current batch (in kBT/nm):")
+                        _stats("LJ", lj_list)
+                        _stats("DIH", dih_list)
+                        _stats("NB(LJ+COUL+DIH)", nb_list)
+                        _stats("TOTAL(+bond+angle)", total_list)
+
+                        for i, cached in enumerate(batch_cache[:3]):
+                            center_idx = cached["entry"].center_index
+                            tf = cached["temp_factor"]
+                            lj_v = (cached["forces_lj"][center_idx] * tf).detach().cpu().numpy()
+                            if center_only_dihedrals:
+                                dih_v = (cached["dihedral_force"] * tf).detach().cpu().numpy()
+                            else:
+                                dih_v = (cached["dihedral_force"][center_idx] * tf).detach().cpu().numpy()
+                            print(
+                                f"        sample {i}, center={center_idx}: "
+                                f"LJ={lj_v}, DIH={dih_v}"
+                            )
+                except Exception as e:
+                    print(f"        [WARN] Failed to dump LJ/DIH debug info: {e!r}")
+                # ====== LJ / dihedral 检查结束 ======
+
+                bad_grad = True
+                break
+
+
+        if bad_grad:
+            optimizer.zero_grad()
+            break
+
+
+        # 4) 可选：做一个梯度裁剪，防止一步迈太大
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                [sigma_param, epsilon_param, dihedral_param],
+                max_norm=float(getattr(args, "max_grad_norm", 100.0)),
+            )
+        except Exception as e:
+            # 理论上不会出问题，这里只是兜个底
+            print(f"[WARN] Gradient clipping failed at iteration {iteration}: {e!r}")
+
         optimizer.step()
 
         loss_value = float(loss_tensor.item())
+
         logger.eval_counter += 1
+
+        if profile_step:
+            print(
+                f"[PROFILE] iter={iteration} build_params={build_params_time:.6f}s "
+                f"forces_lj={forces_lj_time:.6f}s forces_dih={forces_dih_time:.6f}s "
+                f"loss_backward={loss_backward_time:.6f}s"
+            )
+
 
         if loss_value + 1e-12 < best_loss:
             best_loss = loss_value
@@ -1985,6 +2238,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("cpu", "gpu"),
         default="gpu",
         help="Device for LJ force evaluation (GPU requires torch with CUDA)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Number of PreparedEntries to process per forward batch (default: all)",
+    )
+    parser.add_argument(
+        "--profile-step",
+        action="store_true",
+        help="Enable per-iteration timing for LJ/dihedral/loss to identify bottlenecks",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-2, help="Learning rate for the GPU optimiser")
     parser.add_argument("--patience", type=int, default=1000, help="Early stopping patience for both optimisers")
