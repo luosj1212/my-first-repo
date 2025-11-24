@@ -1255,14 +1255,14 @@ def fit_single_entry(
     targets = entry.target_force - entry.coulomb_force - entry.bonded_force
 
     # 正则化 + 线性求解
-    A_use, y_use, s_col, s_y = _normalise_system(design, targets)
+    # A_use, y_use, s_col, s_y = _normalise_system(design, targets)
     prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
 
-    theta_norm, diagnostics = solve_least_squares(
-        A_use, y_use, solver, alpha, nonneg, prior=prior
+    theta, diagnostics = solve_least_squares(
+        design, targets, solver, alpha, nonneg, prior=prior
     )   
     # theta_norm, diagnostics = solve_least_squares(A_use, y_use, solver, alpha, nonneg)
-    theta = _denormalise_theta(theta_norm, s_col, s_y)
+    # theta = _denormalise_theta(theta_norm, s_col, s_y)
 
     # 约束 1：含 H_h 的 pair -> alpha=beta=0（可选）
     if fix_hh_zero:
@@ -1716,12 +1716,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "Warning: Ill-conditioned design matrix; consider adding regularisation or more diverse data.",
                     flush=True,
                 )
-        A_use, y_use, s_col, s_y = _normalise_system(design, targets)
+        # A_use, y_use, s_col, s_y = _normalise_system(design, targets)
         prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
 
-        theta_norm, diagnostics = solve_least_squares(A_use, y_use, args.solver, args.alpha, args.nonneg, prior=prior)   
+        joint_theta, diagnostics = solve_least_squares(design, targets, args.solver, args.alpha, args.nonneg, prior=prior)   
         # theta_norm, diagnostics = solve_least_squares(A_use, y_use, args.solver, args.alpha, args.nonneg)
-        joint_theta = _denormalise_theta(theta_norm, s_col, s_y)
+        # joint_theta = _denormalise_theta(theta_norm, s_col, s_y)
         if args.fit_dihedral and dih_col_idx is not None:
             s_dih = float(joint_theta[dih_col_idx])
             output["meta"]["dihedral_scale"] = s_dih
@@ -1798,58 +1798,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     group_fits: List[Dict[str, object]] = []
     if args.group_size is not None and args.group_size > 0:
         gsz = int(args.group_size)
-        # 使用已有的 entry_pairs；按顺序每 gsz 个 entry 一组
         for start in range(0, len(entries), gsz):
             end = min(len(entries), start + gsz)
             sub_entries = entries[start:end]
             sub_pairs_list = entry_pairs[start:end]
 
-            # 收集该组内出现过的 pair_type
+            # 1) 这一组里实际出现过的 pair_type
             local_pair_types_dict: Dict[Tuple[str, str], None] = {}
             for pairs in sub_pairs_list:
                 for p in pairs:
                     local_pair_types_dict.setdefault(p["pair_type"], None)
             local_pair_types = sorted(local_pair_types_dict.keys())
             if not local_pair_types:
-                continue  # 这一组没有有效 pair，跳过
+                continue
 
-            # 用这一组的 entries + pair 构造线性系统
+            # 2) 构建该组自己的线性系统
             design_g, targets_g, pair_index_g, dih_col_idx_g = build_design_matrix(
                 sub_entries,
                 sub_pairs_list,
                 local_pair_types,
                 fit_dihedral=args.fit_dihedral,
             )
-
             if design_g.size == 0:
                 continue
 
+            # 3) 这一组自己的 prior（按 local_pair_types，而不是全局）
+            prior_g = build_prior_from_summary(local_pair_types, summary)
 
-            # 正则化 + 解
-            A_g, y_g, s_col_g, s_y_g = _normalise_system(design_g, targets_g)
-            prior = build_prior_from_summary(pair_types, summary)  # summary_data 是你 main() 里读的 summary json
-
-            theta_norm_g, diagnostics = solve_least_squares(
-                design,
-                targets,
+            # 4) 在线性系统上做岭回归 / QR / NNLS（solve_least_squares 里已经做了归一化）
+            theta_g, diag_g = solve_least_squares(
+                design_g,
+                targets_g,
                 solver=args.solver,
                 alpha=args.alpha,
                 nonneg=args.nonneg,
-                prior=prior,
-            )   
-            # theta_norm_g, diag_g = solve_least_squares(
-            #     A_g, y_g, args.solver, args.alpha, args.nonneg
-            # )
-            theta_g = _denormalise_theta(theta_norm_g, s_col_g, s_y_g)
+                prior=prior_g,
+            )
 
-            # 可选：强制含 H_h 的 pair 为 0
+            # 5) 可选：强制含 H_h 的 pair 为 0
             if args.fix_hh_zero:
                 for pair, idx in pair_index_g.items():
                     if "H_h" in pair:
                         theta_g[2 * idx] = 0.0
                         theta_g[2 * idx + 1] = 0.0
 
-            # 拟合质量（用这一组内的 entries）
+            # 6) 用本组的 design_g / targets_g / sub_entries 评估
             metrics_g = evaluate_fit(
                 design_g,
                 targets_g,
@@ -1876,7 +1869,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "design_matrix_shape": list(design_g.shape),
             }
 
-            # 如开启 recover-sigma-eps，则对该组也恢复一组 σ/ε
+            # 7) 如开启 recover-sigma-eps，对该组恢复一组 σ/ε（同样用 local_pair_types）
             if args.recover_sigma_eps:
                 recovered_g = recover_sigma_epsilon(
                     local_pair_types,
@@ -1897,6 +1890,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output["meta"]["group_fit_count"] = len(group_fits)
         output["meta"]["group_size"] = gsz
     # ====== 分组拟合结束 ======
+
 
 
     if args.output is not None:
