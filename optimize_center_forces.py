@@ -119,6 +119,16 @@ class LinearizedLJSystem:
     pair_metadata: PairMetadata
 
 
+@dataclass
+class LinearizedDihedralSystem:
+    A_dih: np.ndarray
+    F_fixed_kJ: np.ndarray
+    F_target_kBT: np.ndarray
+    temperature_factors: np.ndarray
+    param_pattern_idx: np.ndarray
+    param_coeff_idx: np.ndarray
+
+
 def load_json(path: Path) -> Mapping[str, object] | Sequence[object]:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
@@ -743,6 +753,154 @@ def build_linearized_lj_system(
     return system, sigma_all, epsilon_all
 
 
+def _dihedral_basis_forces(
+    dih: Any, coords: np.ndarray, coeff_idx: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
+
+    b1 = coords[i] - coords[j]
+    b2 = coords[k] - coords[j]
+    b3 = coords[l] - coords[k]
+
+    c1 = np.cross(b2, b3)
+    c2 = np.cross(b1, b2)
+
+    nb2 = max(float(np.linalg.norm(b2)), 1e-12)
+    nc1 = max(float(np.linalg.norm(c1)), 1e-12)
+    nc2 = max(float(np.linalg.norm(c2)), 1e-12)
+
+    x = float(np.dot(c2, c1))
+    y = nb2 * float(np.dot(b1, c1))
+    phi = math.atan2(y, x)
+
+    cosp = math.cos(phi)
+    sinp = math.sin(phi)
+    cp = 1.0
+    s = 0.0
+    for n_ in range(1, 6):
+        cp = cosp ** (n_ - 1)
+        if n_ == coeff_idx:
+            s += n_ * 1.0 * cp
+    dVdphi = -sinp * s
+
+    dphi_di = (nb2 / (nc2 * nc2)) * c2
+    dphi_dl = (nb2 / (nc1 * nc1)) * c1
+
+    db1b2 = float(np.dot(b1, b2))
+    db3b2 = float(np.dot(b3, b2))
+    term_j1 = (db1b2 / nb2) / (nc2 * nc2)
+    term_j2 = (db3b2 / nb2) / (nc1 * nc1)
+    dphi_dj = term_j1 * c2 + term_j2 * c1
+    dphi_dk = -(dphi_di + dphi_dj + dphi_dl)
+
+    Fi = -dVdphi * dphi_di
+    Fj = -dVdphi * dphi_dj
+    Fk = -dVdphi * dphi_dk
+    Fl = -dVdphi * dphi_dl
+
+    m = 0.5 * (coords[j] + coords[k])
+    ri, rj, rk, rl = coords[i] - m, coords[j] - m, coords[k] - m, coords[l] - m
+    tau = np.cross(ri, Fi) + np.cross(rj, Fj) + np.cross(rk, Fk) + np.cross(rl, Fl)
+    cross_bt = np.cross(b2, tau)
+    denom = float(np.dot(b2, b2)) + 1e-30
+    Delta = -cross_bt / denom
+
+    Fj = Fj + Delta
+    Fk = Fk - Delta
+
+    return Fi, Fj, Fk, Fl
+
+
+def build_linearized_dihedral_system(
+    prepared_entries: Sequence[PreparedEntry],
+    summary: MutableMapping[str, object],
+    dihedral_targets: Sequence[OptimisableDihedralEntry],
+    rvdw: float,
+) -> LinearizedDihedralSystem:
+    n_entries = len(prepared_entries)
+    dihedral_lookup = {slot.summary_index: idx for idx, slot in enumerate(dihedral_targets)}
+
+    param_pattern_idx: List[int] = []
+    param_coeff_idx: List[int] = []
+    param_lookup: Dict[Tuple[int, int], int] = {}
+    for p_idx, _target in enumerate(dihedral_targets):
+        for coeff_idx in range(1, 6):
+            col = len(param_pattern_idx)
+            param_pattern_idx.append(p_idx)
+            param_coeff_idx.append(coeff_idx)
+            param_lookup[(p_idx, coeff_idx)] = col
+
+    n_params = len(param_pattern_idx)
+    A_dih = np.zeros((n_entries, n_params, 3), dtype=np.float64)
+    F_fixed_kJ = np.zeros((n_entries, 3), dtype=np.float64)
+    F_target_kBT = np.zeros((n_entries, 3), dtype=np.float64)
+    temperature_factors = np.zeros(n_entries, dtype=np.float64)
+
+    for entry_idx, prepared in enumerate(prepared_entries):
+        entry = prepared.entry
+        top = prepared.topology
+        lj_force_full = compute_nonbonded_forces(
+            top,
+            entry.coords,
+            rcoul=0.0,
+            rvdw=rvdw,
+            do_lj=True,
+            do_coul=False,
+            device="cpu",
+        )
+        F_fixed_kJ[entry_idx] = (
+            np.asarray(entry.bond_force_kj, dtype=float)
+            + np.asarray(entry.angle_force_kj, dtype=float)
+            + np.asarray(entry.coulomb_force_kj, dtype=float)
+            + np.asarray(lj_force_full[int(entry.center_index)], dtype=float)
+        )
+        F_target_kBT[entry_idx] = np.asarray(entry.target_force, dtype=float)
+        temperature_factors[entry_idx] = float(prepared.temperature_factor)
+
+        if not top.rb_dihedrals or not param_lookup:
+            continue
+        center_idx = int(entry.center_index)
+        dih_indices: Iterable[int] = (
+            prepared.center_dihedral_indices
+            if prepared.center_dihedral_indices is not None
+            else range(len(top.rb_dihedrals))
+        )
+        for dih_idx in dih_indices:
+            dih = top.rb_dihedrals[dih_idx]
+            src = getattr(dih, "source_entry_idx", -1)
+            mapped = dihedral_lookup.get(int(src))
+            if mapped is None:
+                continue
+            i, j, k, l = dih.i - 1, dih.j - 1, dih.k - 1, dih.l - 1
+            if center_idx not in (i, j, k, l):
+                continue
+            for coeff_idx in range(1, 6):
+                param_idx = param_lookup.get((mapped, coeff_idx))
+                if param_idx is None:
+                    continue
+                Fi, Fj, Fk, Fl = _dihedral_basis_forces(dih, entry.coords, coeff_idx)
+                contrib = (
+                    Fi
+                    if center_idx == i
+                    else Fj
+                    if center_idx == j
+                    else Fk
+                    if center_idx == k
+                    else Fl
+                )
+                A_dih[entry_idx, param_idx, :] += contrib.astype(float)
+
+    system = LinearizedDihedralSystem(
+        A_dih=A_dih,
+        F_fixed_kJ=F_fixed_kJ,
+        F_target_kBT=F_target_kBT,
+        temperature_factors=temperature_factors,
+        param_pattern_idx=np.asarray(param_pattern_idx, dtype=np.int64),
+        param_coeff_idx=np.asarray(param_coeff_idx, dtype=np.int64),
+    )
+    return system
+
+
 def _compute_pair_alpha_beta_torch(
     sigma_full: "torch.Tensor",
     epsilon_full: "torch.Tensor",
@@ -767,6 +925,48 @@ def _compute_pair_alpha_beta_torch(
     beta = torch.where(valid, 4.0 * eps_mix * sigma6, torch.zeros_like(sig_mix))
     alpha = beta * sigma6
     return alpha, beta
+
+
+def solve_dihedral_least_squares(
+    system: LinearizedDihedralSystem,
+    dihedral_targets: Sequence[OptimisableDihedralEntry],
+    ridge: float = 1e-8,
+) -> np.ndarray:
+    n_entries = system.F_fixed_kJ.shape[0]
+    n_params = system.A_dih.shape[1] if system.A_dih.ndim >= 2 else 0
+    if n_params == 0:
+        return np.array([target.coeffs for target in dihedral_targets], dtype=float)
+
+    y = np.zeros(3 * n_entries, dtype=np.float64)
+    X = np.zeros((3 * n_entries, n_params), dtype=np.float64)
+
+    for e_idx in range(n_entries):
+        start = 3 * e_idx
+        target = system.F_target_kBT[e_idx] / max(system.temperature_factors[e_idx], 1e-12)
+        fixed = system.F_fixed_kJ[e_idx]
+        y[start : start + 3] = target - fixed
+        X[start : start + 3, :] = system.A_dih[e_idx].T
+        assert system.A_dih.shape[0] == n_entries
+        assert system.A_dih.shape[1] == n_params
+        assert system.A_dih.shape[2] == 3
+
+
+    row_mask = np.any(X != 0.0, axis=1)
+    X_reduced = X[row_mask]
+    y_reduced = y[row_mask]
+
+    if X_reduced.size == 0:
+        return np.array([target.coeffs for target in dihedral_targets], dtype=float)
+
+    XtX = X_reduced.T @ X_reduced + ridge * np.eye(n_params, dtype=np.float64)
+    Xty = X_reduced.T @ y_reduced
+    sol = np.linalg.lstsq(XtX, Xty, rcond=None)[0]
+
+    coeff_matrix = np.array([target.coeffs for target in dihedral_targets], dtype=float)
+    for col, pattern_idx in enumerate(system.param_pattern_idx):
+        coeff_idx = int(system.param_coeff_idx[col])
+        coeff_matrix[pattern_idx, coeff_idx] = sol[col]
+    return coeff_matrix
 
 
 def apply_lj_parameters(
@@ -2230,6 +2430,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--epsilon-min", type=float, default=0.01)
     parser.add_argument("--epsilon-max", type=float, default=10.0)
     parser.add_argument("--optimize-dihedrals", action="store_true")
+    parser.add_argument(
+        "--linear-dihedrals",
+        action="store_true",
+        help="solve RB dihedral coefficients by linear least squares instead of non-linear GPU optimisation",
+    )
     parser.add_argument("--dihedral-min", type=float, default=-10.0)
     parser.add_argument("--dihedral-max", type=float, default=10.0)
     parser.add_argument("--max-iter", type=int, default=10000)
@@ -2378,7 +2583,125 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     use_torch_optimizer = torch is not None and args.device.lower() == "gpu"
     result_meta: Dict[str, object]
-    if use_torch_optimizer:
+    if args.linear_dihedrals and args.optimize_dihedrals:
+        if torch is not None:
+            sigma_opt, epsilon_opt, result_meta = run_linearized_torch_optimizer(
+                linear_system,
+                sigma_all_summary,
+                epsilon_all_summary,
+                trainable_summary_indices,
+                sigma0,
+                epsilon0,
+                args,
+                logger,
+            )
+        else:
+            bounds: List[Tuple[float, float]] = []
+            for _ in lj_targets:
+                bounds.append((args.sigma_min, args.sigma_max))
+            for _ in lj_targets:
+                bounds.append((args.epsilon_min, args.epsilon_max))
+
+            def _pack(s: NDArray[np.float32], e: NDArray[np.float32]) -> NDArray[np.float32]:
+                return np.concatenate([s, e])
+
+            def _unpack(vec: Sequence[float]) -> Tuple[NDArray[np.float32], NDArray[np.float32]]:
+                vec = np.asarray(vec, dtype=float)
+                n = len(lj_targets)
+                s = vec[:n]
+                e = vec[n:]
+                return s, e
+
+            best_state = {
+                "loss": float(initial_metrics["loss"]["total"]),
+                "vec": _pack(sigma0, epsilon0),
+            }
+            early_stopper = EarlyStopping(
+                patience=int(args.patience), initial_loss=best_state["loss"], min_delta=1e-9
+            )
+
+            def objective(vec: Sequence[float]) -> float:
+                sigma, epsilon = _unpack(vec)
+                apply_lj_parameters(summary, lj_targets, sigma, epsilon)
+                refresh_prepared_topologies(prepared_entries, summary)
+                pred = predict_forces(
+                    summary,
+                    prepared_entries,
+                    rvdw=args.rvdw,
+                    device=args.device,
+                    recompute_dihedral=bool(dihedral_targets),
+                    center_only_dihedrals=bool(dihedral_targets),
+                )
+                metrics = compute_metrics(pred, targets)
+                logger.eval_counter += 1
+                if logger.eval_counter % max(int(args.log_interval), 1) == 0:
+                    logger.log(
+                        "iteration",
+                        metrics,
+                        logger.snapshot_params(sigma, epsilon, dihedral0 if dihedral_targets else None),
+                        iteration=logger.eval_counter,
+                    )
+
+                loss_value = metrics["loss"]["total"]
+                if loss_value < best_state["loss"] - 1e-12:
+                    best_state["loss"] = loss_value
+                    best_state["vec"] = _pack(sigma, epsilon)
+                if early_stopper.update(loss_value):
+                    raise EarlyStopException(
+                        f"No improvement for {args.patience} evaluations; stopping early."
+                    )
+                return loss_value
+
+            try:
+                result = minimize(
+                    objective,
+                    _pack(sigma0, epsilon0),
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={"maxiter": args.max_iter, "disp": True},
+                )
+            except EarlyStopException as exc:
+                print(f"[EARLY STOP] {exc}")
+                result = SimpleNamespace(
+                    x=best_state["vec"],
+                    success=False,
+                    message=str(exc),
+                    nfev=int(logger.eval_counter),
+                    nit=int(logger.eval_counter),
+                )
+
+            sigma_opt, epsilon_opt = _unpack(best_state["vec"])
+            result_meta = {
+                "method": "L-BFGS-B",
+                "success": bool(result.success),
+                "message": result.message,
+                "nfev": int(result.nfev),
+                "nit": int(result.nit),
+            }
+
+        apply_lj_parameters(summary, lj_targets, sigma_opt, epsilon_opt)
+        refresh_prepared_topologies(prepared_entries, summary)
+        dihedral_system = build_linearized_dihedral_system(
+            prepared_entries, summary, dihedral_targets, args.rvdw
+        )
+        dihedral_opt = solve_dihedral_least_squares(dihedral_system, dihedral_targets)
+        apply_dihedral_parameters(summary, dihedral_targets, dihedral_opt)
+        refresh_prepared_topologies(prepared_entries, summary)
+        dih_pred = predict_forces(
+            summary,
+            prepared_entries,
+            rvdw=args.rvdw,
+            device=args.device,
+            recompute_dihedral=True,
+            center_only_dihedrals=True,
+        )
+        dih_metrics = compute_metrics(dih_pred, targets)
+        logger.log(
+            "dihedral_linear",
+            dih_metrics,
+            logger.snapshot_params(sigma_opt, epsilon_opt, dihedral_opt),
+        )
+    elif use_torch_optimizer:
         if dihedral_targets:
             sigma_opt, epsilon_opt, dihedral_opt, result_meta = run_torch_force_optimizer(
                 prepared_entries,
