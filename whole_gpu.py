@@ -557,6 +557,87 @@ def worker_build_payload_and_xtb(args):
     return int(gidx), payload, charges, coulomb
 
 
+def worker_full_pipeline(args):
+    (
+        gidx,
+        gro_path,
+        center_idx,
+        radius_A,
+        water_radius_A,
+        atoms_info,
+        bonds_info,
+        temperature,
+        xtb_path,
+        xtb_total_charge,
+        xtb_method,
+    ) = args
+
+    u = mda.Universe(gro_path, convert_units=True)
+    prep = _prepare_slice(
+        u,
+        center_idx,
+        radius_A,
+        water_radius_A,
+        atoms_info=atoms_info,
+        bonds_info=bonds_info,
+    )
+    if prep is None:
+        return None
+
+    rd_mol, coordsA, center_local, atom_types, charges = prep
+    mol_block = Chem.MolToMolBlock(rd_mol)
+    data = build_data(rd_mol, coordsA, int(center_local))
+
+    def _to_np(x):
+        if x is None:
+            return None
+        if isinstance(x, np.ndarray):
+            return x
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    payload = {
+        "pos": _to_np(getattr(data, "pos", None)),
+        "x": _to_np(getattr(data, "x", None)),
+        "adj_edge_index": _to_np(getattr(data, "adj_edge_index", None)),
+        "adj_edge_weight": _to_np(getattr(data, "adj_edge_weight", None)),
+        "dist_edge_index": _to_np(getattr(data, "dist_edge_index", None)),
+        "dist_edge_weight": _to_np(getattr(data, "dist_edge_weight", None)),
+        "global_features": _to_np(getattr(data, "global_features", None)),
+        "global_raw": getattr(data, "_global_raw", None),
+        "dist_full": getattr(data, "_dist_full", None),
+        "center": int(center_local),
+        "num_nodes": int(getattr(data, "num_nodes", coordsA.shape[0])),
+    }
+
+    charges_arr = np.asarray(charges, dtype=np.float32)
+    coulomb = np.zeros(3, dtype=np.float32)
+    if xtb_path is not None:
+        try:
+            charges_arr = run_xtb_for_mol(
+                rd_mol,
+                coordsA,
+                xtb_path,
+                total_charge=xtb_total_charge,
+                method=xtb_method,
+            )
+        except Exception as exc:
+            print(
+                f"[WARN] xTB pipeline failed at center {center_idx}: {exc}. Using fallback charges."
+            )
+
+    meta_item = {
+        "coordsA": coordsA,
+        "atom_types": atom_types,
+        "charges": charges_arr,
+        "center_global": center_idx,
+        "gro_file": os.path.basename(gro_path),
+    }
+
+    return int(gidx), payload, charges_arr, coulomb, meta_item
+
+
 # --------------------------------------------------------------------------------------
 # Main pipeline
 # --------------------------------------------------------------------------------------
@@ -615,10 +696,14 @@ def run_inference(
         if fut.cancelled():
             return
         try:
-            gi, payload, charges_arr, coulomb_force = fut.result()
+            out = fut.result()
         except Exception as exc:
             print(f"[WARN] Worker failed: {exc}")
             return
+        if out is None:
+            return
+        gi, payload, charges_arr, coulomb_force, meta_item = out
+        meta_map[gi] = meta_item
         data_obj = _payload_to_pyg(payload)
         ready_buffer.append((gi, data_obj, charges_arr, coulomb_force))
 
@@ -693,7 +778,8 @@ def run_inference(
     for gf in tqdm(gro_files, desc="Processing GRO files"):
         if max_slices is not None and len(results) >= max_slices:
             break
-        u = mda.Universe(os.path.join(gro_dir, gf), convert_units=True)
+        gro_path = os.path.join(gro_dir, gf)
+        u = mda.Universe(gro_path, convert_units=True)
         center_candidates = _select_centers(u, centers)
         center_candidates = [i for i in center_candidates if _within_range(i, center_idx_range)]
 
@@ -705,35 +791,17 @@ def run_inference(
                 stop_submission = True
                 break
 
-            prep = _prepare_slice(
-                u,
-                cidx,
-                radius_A,
-                water_radius_A,
-                atoms_info=atoms_info,
-                bonds_info=bonds_info,
-            )
-
-            if prep is None:
-                continue
-            rd_mol, coordsA, center_local, atom_types, charges = prep
-            mol_block = Chem.MolToMolBlock(rd_mol)
-
-            meta_map[gidx_counter] = {
-                "coordsA": coordsA,
-                "atom_types": atom_types,
-                "charges": charges,
-                "center_global": cidx,
-                "gro_file": gf,
-            }
-
             if use_workers:
                 fut = executor.submit(
-                    worker_build_payload_and_xtb,
+                    worker_full_pipeline,
                     (
                         gidx_counter,
-                        mol_block,
-                        center_local,
+                        gro_path,
+                        cidx,
+                        radius_A,
+                        water_radius_A,
+                        atoms_info,
+                        bonds_info,
                         temperature,
                         xtb_path if use_xtb else None,
                         xtb_total_charge,
@@ -749,19 +817,26 @@ def run_inference(
                     stop_submission = True
                     break
             else:
-                gi, payload, charges_arr, coulomb_force = worker_build_payload_and_xtb(
+                out = worker_full_pipeline(
                     (
                         gidx_counter,
-                        mol_block,
-                        center_local,
+                        gro_path,
+                        cidx,
+                        radius_A,
+                        water_radius_A,
+                        atoms_info,
+                        bonds_info,
                         temperature,
                         None,
                         xtb_total_charge,
                         xtb_method,
                     )
                 )
-                ready_buffer.append((gi, _payload_to_pyg(payload), charges_arr, coulomb_force))
-                flush_ready()
+                if out is not None:
+                    gi, payload, charges_arr, coulomb_force, meta_item = out
+                    meta_map[gi] = meta_item
+                    ready_buffer.append((gi, _payload_to_pyg(payload), charges_arr, coulomb_force))
+                    flush_ready()
 
             gidx_counter += 1
 
